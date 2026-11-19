@@ -15,6 +15,9 @@ class RoadView(QWidget):
         self.scale=13.
         self.selected=0
         self.drag=None
+        self.result_provider=None
+        self.caption='GÓC NHÌN TỪ TRÊN • CAMERA BÁM XE'
+        self.scale_peer=None
         self.setMinimumSize(420,440)
 
     def point(self,x,y):
@@ -45,7 +48,8 @@ class RoadView(QWidget):
         c,s=math.cos(ego.heading),math.sin(ego.heading)
         def mounted(bx,by):
             return self.point(ego.x+c*bx-s*by,ego.y+s*bx+c*by)
-        for radar_id,(mx,my,yaw) in MOUNTS.items():
+        mounts={r:(0,.25 if r=='LEFT' else -.25,math.pi) for r in ('LEFT','RIGHT')} if self.session.dataset else MOUNTS
+        for radar_id,(mx,my,yaw) in mounts.items():
             origin=mounted(mx,my)
             path=QPainterPath(origin)
             cfg=self.session.radar.config
@@ -61,7 +65,9 @@ class RoadView(QWidget):
             if frame:
                 age=round(self.session.world.t*1000)-frame['t_ms']
                 for target in frame['targets']:
-                    bx,by=radar_to_body(radar_id,*coordinates(target))
+                    if self.session.dataset:
+                        forward,lateral=coordinates(target);bx,by=mx-forward,my-lateral
+                    else:bx,by=radar_to_body(radar_id,*coordinates(target))
                     dest=mounted(bx,by)
                     p.setPen(QPen(QColor('#3f7e8b' if age<260 else '#54616b'),1,Qt.DotLine))
                     p.drawLine(origin,dest)
@@ -74,7 +80,7 @@ class RoadView(QWidget):
             for vehicle in self.session.world.targets:
                 self.draw_vehicle(p,vehicle,False)
         self.draw_vehicle(p,ego,True)
-        result=self.session.visible_result()
+        result=self.result_provider() if self.result_provider else self.session.visible_result()
         for side,dy in [('left',.9),('right',-.9)]:
             level=result[side]['level'] if result else 'UNKNOWN'
             pos=mounted(.6,dy)
@@ -82,9 +88,14 @@ class RoadView(QWidget):
             if level=='UNKNOWN':
                 p.setPen(QColor('#101c2b'));p.drawText(pos+QPointF(-4,4),'?')
         p.setPen(QColor('#dce9f5'))
-        p.drawText(14,25,'GÓC NHÌN TỪ TRÊN • CAMERA BÁM XE')
+        p.drawText(14,25,self.caption)
+        if self.session.dataset:p.drawText(14,47,'Xe: Oracle giả lập (chỉ hiển thị)')
         p.drawText(14,self.height()-38,f't = {self.session.world.t:.2f} s   |   {self.scale:.0f} px/m   |   mô hình phẳng')
         p.drawText(14,self.height()-16,'Xám: không cảnh báo  •  Vàng: mục tiêu  •  Đỏ: cao  •  ?: mất/thiếu dữ liệu')
+        p.end()
+        if result and result.get('type')=='RESULT' and getattr(self,'last_painted',None)!=(result['session_id'],result['seq']):
+            self.last_painted=(result['session_id'],result['seq'])
+            self.session.mark('paint',result)
 
     def draw_vehicle(self,p,car,ego):
         pos=self.point(car.x,car.y)
@@ -101,10 +112,11 @@ class RoadView(QWidget):
 
     def wheelEvent(self,event):
         self.scale=max(5,min(40,self.scale+(2 if event.angleDelta().y()>0 else -2)))
+        if self.scale_peer:self.scale_peer.scale=self.scale;self.scale_peer.update()
         self.update()
 
     def mousePressEvent(self,event):
-        if self.session.state!='PAUSED' or self.session.pending or self.session.replay:
+        if self.session.state!='PAUSED' or self.session.pending or self.session.replay or self.session.dataset:
             return
         for car in [self.session.world.ego,*self.session.world.targets]:
             if (self.point(car.x,car.y)-event.position()).manhattanLength()<35:

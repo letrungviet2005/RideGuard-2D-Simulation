@@ -2,7 +2,8 @@ from pathlib import Path
 import pytest
 from rideguard_sim.replay import load,coordinates
 
-SAMPLE=Path(__file__).parents[1]/'samples/radar_recorded_excerpt.csv'
+# The recordings live next to the tool: <repo>/tools/samples/.
+SAMPLE=Path(__file__).parents[2]/'samples/radar_recorded_excerpt.csv'
 
 
 def test_recorded_excerpt_and_coordinate_provenance():

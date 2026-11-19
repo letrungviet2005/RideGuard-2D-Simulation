@@ -4,7 +4,7 @@
 
 Đọc [giao thức](../../contracts/sensor-simulation.md), [báo cáo kiểm chứng](../../docs/testing/simulator-2026-11-17.md) trước khi dùng kết quả. Không phải mô hình sóng radar hoặc công cụ chứng minh an toàn giao thông.
 
-> **Mới:** xem [HUONG-DAN.md](HUONG-DAN.md) để có hướng dẫn đầy đủ từng bước — cài app, nạp firmware ESP32 (kèm xử lý nút BOOT), và ý nghĩa/tác dụng của từng trường giả lập trong giao diện.
+> **Mới:** xem [HUONG-DAN.md](../HUONG-DAN.md) để có hướng dẫn đầy đủ từng bước — cài app, nạp firmware ESP32 (kèm xử lý nút BOOT), và ý nghĩa/tác dụng của từng trường giả lập trong giao diện.
 
 ## Chạy từ gốc repository — PowerShell
 
@@ -51,6 +51,66 @@ Bấm **Dừng phiên**, chờ ACK rồi nhập `samples/radar_recorded_excerpt.
 - Hi-Link gọi y là tọa độ Y; hiển thị dùng `forward=y`, `lateral=y*tan(angle)`. Dữ liệu CSV gốc `x_m≈y*sin(angle)`, `fwd_m≈y*cos(angle)` được giữ nguyên để đối chiếu, không âm thầm sửa. Chiều góc/mount vẫn cần xác minh bằng bố trí radar thật.
 - Không bật IMU: không tạo chuyển động ego và ghi **Chưa có dữ liệu chuyển động xe mình**. Chỉ một radar có dữ liệu nên bo phải UNKNOWN; đó không phải lỗi để sửa thành NONE.
 - Nếu chủ động bật checkbox IMU giả lập, hiện **Radar ghi thực + IMU giả lập, chưa đồng bộ đo thực**. Đây không phải dữ liệu IMU đo cùng CSV. Không bù radar còn thiếu bằng frame rỗng giả.
+
+## CSV IMU 14 cột (profile theo bảng người dùng)
+
+[Runbook/schema/lệnh tạo CSV](IMU-CSV.md) là hướng dẫn hiện tại. GUI có nút
+**Nhập CSV IMU 14 cột**, chọn `user_table_v1` hoặc compatibility `physical_only`,
+mount Euler, offset µs, sáu giá trị và đồ thị, export CSV từ phiên tổng hợp.
+Giữ µs gốc; không lượng tử tiến khi trùng ms. `user_table_v1` kiểm đúng14cột,
+RAW int16 và scale0,000122g/LSB,0,0175dps/LSB; chưa xác minh chip phần cứng.
+`physical_only` cho log cũ, không kiểm hệ số RAW. Không tự coi nhập CSV là đo thật.
+
+Mẫu mới `../samples/imu14-v1/` có bảy kịch bản45giây/200Hz, mỗi file9000mẫu;
+`../samples/reference/user-provided-14rows.csv` span64,985ms nguồn USER_PROVIDED.
+200Hz+radar mặc định bị từ chối ở1× theo ngân sách bảo thủ; chọn0,5× giữ đủ mẫu.
+Không suy ra đồng bộ từ cùng thời lượng. [Báo cáo18/11](../../docs/testing/imu14-2026-11-18.md)
+ghi riêng128 test PC,GUIthật và replay9000mẫu trênESP32 với899RESULT; không có
+HIGH trong cặp CSV ghép đó. Chưa nghiệm thu cảm biến thật/chuyển làn ngoài đường.
+
+## Thu đồng bộ radar + IMU thật (LD2417 + BMI160)
+
+Firmware `sensor_logger` đọc **một** LD2417 qua UART1 và **một** BMI160 qua
+I2C, đóng dấu mọi bản ghi bằng **cùng một bộ đếm `micros()` của ESP32**. Nhờ
+vậy log radar và log IMU là một timeline, không cần hiệu chỉnh đồng hồ.
+
+Hướng dẫn đầy đủ (nối chân, nạp firmware, chuỗi thu 4 kịch bản, cách đọc
+kết quả đối chiếu): **[THU-LOG-THAT.md](THU-LOG-THAT.md)**.
+
+Tóm tắt:
+
+```powershell
+# 1. Nạp firmware logger (ghi đè firmware app, nạp lại sensor_simulation sau)
+& firmware/.venv/Scripts/python.exe -m platformio run -d R:\firmware -e sensor_logger -t upload
+
+# 2. Ghi log (gõ s + Enter để bắt đầu kịch bản, e + Enter để kết thúc)
+Push-Location tools/rideguard-simulator
+& .venv/Scripts/python.exe -X utf8 capture_hardware.py --port COM5 --out captures
+Pop-Location
+
+# 3. Đối chiếu với mô phỏng
+Push-Location tools/rideguard-simulator
+& .venv/Scripts/python.exe -X utf8 compare_capture.py --capture captures --scenario scenario_00
+Pop-Location
+```
+
+`compare_capture.py` mô phỏng lại **đúng state machine** của firmware (lọc
+yaw 80 ms, ngưỡng 2 dps, xác nhận 200 ms) trên log IMU đo được, nên trả lời
+được "firmware có tin là xe đang rẽ không?" bằng chính dữ liệu thật.
+
+Khi phát lại trong app, **bắt buộc** bật checkbox *Log đồng bộ (radar + IMU
+cùng đồng hồ)* và để *Lệch đồng hồ IMU* = 0 ms. Nếu không, hai file sẽ bị
+dời riêng và lệch nhau đúng bằng khoảng cách giữa mẫu đầu tiên của mỗi file.
+
+Board chỉ có **một** LD2417 nên log chỉ ghi được một phía radar; app yêu cầu
+cả hai phía còn mới, vì vậy firmware báo `RADAR_STALE` khi phát lại log một
+radar. Đây là hành vi đúng, không phải lỗi.
+
+Kiểm thử toàn bộ pipeline khi chưa có board:
+
+```powershell
+& .venv/Scripts/python.exe -X utf8 make_synthetic_capture.py --out captures_synthetic
+```
 
 ## Firmware và khôi phục BLE
 

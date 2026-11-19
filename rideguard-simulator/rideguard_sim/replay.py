@@ -36,7 +36,15 @@ def target(row):
     return result
 
 
-def load(path, radar_id):
+def load(path, radar_id, rebase=True):
+    """Load a radar recording.
+
+    ``rebase`` (the default) shifts every frame so the first one starts at
+    0 ms.  Set it to False to keep the recorded ``ms`` values, which is what
+    a synchronised hardware capture needs: the radar file and the IMU file
+    then keep the same origin and the desktop app aligns them with the IMU
+    offset instead of each importer rebasing on its own first row.
+    """
     if radar_id not in ('LEFT','RIGHT'):
         raise ValueError('Chọn radar gắn LEFT/RIGHT; huong không phải radar_id')
     raw = Path(path).read_text(encoding='utf-8-sig')
@@ -89,7 +97,8 @@ def load(path, radar_id):
         previous_global=frame.t_ms
         if len(frame.targets)>4 or len({t['track_id'] for t in frame.targets})!=len(frame.targets):
             raise ValueError('Too many / duplicate targets')
-        frame.t_ms-=base
+        if rebase:
+            frame.t_ms-=base
     return Recording(str(Path(path).resolve()),raw,frames)
 
 

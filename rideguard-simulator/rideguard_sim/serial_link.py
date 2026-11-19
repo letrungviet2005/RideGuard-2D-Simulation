@@ -6,6 +6,7 @@ import time
 import serial
 from serial.tools import list_ports
 from .protocol import encode, MAX_LINE
+from .timing import TimingTrace
 
 
 def ports():
@@ -19,6 +20,7 @@ class SerialLink:
         self.stop = threading.Event()
         self.error = None
         self.bytes_sent = 0
+        self.trace = TimingTrace()
         self.port, self.baud = port, baud
         # The ESP32 boot ROM handshake floods the UART with non-protocol bytes.
         # Sending before that noise drains corrupts the first frame, and the
@@ -32,7 +34,9 @@ class SerialLink:
         if not self.ready.is_set():
             raise RuntimeError('Serial chưa sẵn sàng; đợi kết nối hoàn tất')
         try:
-            self.tx.put_nowait(encode(message))
+            data = encode(message)
+            self.tx.put_nowait((data, message))
+            self.trace.mark('enqueue', message, size=len(data), depth=self.tx.qsize())
         except queue.Full:
             self.error = 'TX backlog: session stopped; reduce simulation speed/rate'
             self.stop.set()
@@ -56,10 +60,14 @@ class SerialLink:
                 while not self.stop.is_set():
                     for _ in range(12):
                         try:
-                            data = self.tx.get_nowait()
+                            data, message = self.tx.get_nowait()
                         except queue.Empty:
                             break
-                        connection.write(data)
+                        started = time.perf_counter_ns()
+                        written = connection.write(data)
+                        self.trace.mark('write', message, size=written, start_ns=started, depth=self.tx.qsize())
+                        if written != len(data):
+                            raise IOError('Partial serial write')
                         self.bytes_sent += len(data)
                     buffer.extend(connection.read(max(1, min(connection.in_waiting, 8192))))
                     while b'\n' in buffer:
@@ -72,7 +80,10 @@ class SerialLink:
                                 raise ValueError('RX is not an object')
                         except (ValueError, UnicodeDecodeError):
                             decoded = {'type': 'TRANSPORT_NOTICE', 'text': raw[:120].decode(errors='replace')}
-                        self.rx.put_nowait((time.monotonic(), decoded))
+                        received = time.monotonic()
+                        self.trace.mark('receive', decoded, size=len(raw)+1, depth=self.rx.qsize(),
+                                        diagnostics=decoded.get('diag'), sensors=decoded.get('sensors'))
+                        self.rx.put_nowait((received, decoded))
                     if len(buffer)>MAX_LINE:
                         raise ValueError('Unterminated RX line exceeds limit')
         except Exception as error:

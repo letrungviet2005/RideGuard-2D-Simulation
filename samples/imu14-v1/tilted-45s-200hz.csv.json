@@ -1,0 +1,55 @@
+{
+  "source": "SYNTHETIC",
+  "scenario": "tilted",
+  "seed": 17,
+  "nominal_duration_s": 45,
+  "sample_count": 9000,
+  "sample_rate_hz": 200,
+  "timestamp_span_us": 44995000,
+  "sample_interval_convention": "half-open [0,duration); N=duration*rate",
+  "clock_id": "synthetic-17-tilted",
+  "clock_evidence": "IMU_ONLY; radar synchronization requires same simulation run identity",
+  "mount_sensor_to_body_deg": [
+    0,
+    0,
+    0
+  ],
+  "vehicle_axes": "X forward, Y left, Z up",
+  "specific_force": "R_world_body^T * (a_world - [0,0,-9.80665])",
+  "accel_noise_g": 0,
+  "gyro_noise_dps": 0,
+  "accel_bias_g": [
+    0,
+    0,
+    0
+  ],
+  "gyro_bias_dps": [
+    0,
+    0,
+    0
+  ],
+  "sha256": "9a94d9ddfe334a44da5aed7c1c66b1a2351a48a5ac9601dab3d54e7d9428098c",
+  "columns": [
+    "timestamp_us",
+    "ax_raw",
+    "ay_raw",
+    "az_raw",
+    "gx_raw",
+    "gy_raw",
+    "gz_raw",
+    "ax_g",
+    "ay_g",
+    "az_g",
+    "gx_dps",
+    "gy_dps",
+    "gz_dps",
+    "temperature_C"
+  ],
+  "profile": "user_table_v1",
+  "accel_g_per_lsb": 0.000122,
+  "gyro_dps_per_lsb": 0.0175,
+  "profile_hardware_verified": false,
+  "sensor_model": "UNKNOWN",
+  "saturation": "reject",
+  "temperature_kind": "SIMULATED_SENSOR_DIE"
+}

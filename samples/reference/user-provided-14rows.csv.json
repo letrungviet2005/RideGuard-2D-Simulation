@@ -1,0 +1,9 @@
+{
+  "source": "USER_PROVIDED",
+  "sensor_model": "UNKNOWN",
+  "hardware_configuration_verified": false,
+  "labels": null,
+  "sha256": "ef1e1ce909786f9dbfd2dcb7e7a9941b8a2618b520ec654eeaef7a3b8edcea8d",
+  "profile": "user_table_v1",
+  "profile_hardware_verified": false
+}

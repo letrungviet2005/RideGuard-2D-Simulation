@@ -6,6 +6,10 @@ Tài liệu này hướng dẫn ba việc:
 2. [Nạp firmware `sensor_simulation` lên ESP32](#2-nạp-firmware-sensor_simulation-lên-esp32)
 3. [Hiểu các trường giả lập trong app và tác dụng của chúng](#3-các-trường-giả-lập-trong-app-và-tác-dụng)
 
+> **Cần đo thật radar + IMU?** Xem [THU-LOG-THAT.md](THU-LOG-THAT.md) —
+> hướng dẫn nạp firmware logger, thu đồng bộ LD2417 + BMI160, đối chiếu
+> với mô phỏng cho kịch bản đi thẳng / rẽ trái / rẽ phải / rung đường.
+
 > **Nguyên tắc quan trọng:** Đèn cảnh báo trên giao diện **luôn lấy từ `RESULT` thật của ESP32**, không bao giờ lấy từ kỳ vọng của kịch bản. Muốn biết firmware nghĩ gì thì nhìn panel **KẾT QUẢ THỰC TỪ ESP32**. Khi chưa có phản hồi hợp lệ, panel hiện *"Chưa có phản hồi ESP32 hợp lệ"* chứ không tự suy diễn `NONE`.
 
 ---
@@ -69,6 +73,7 @@ Cờ `-X utf8` là bắt buộc để tiếng Việt trong log và cửa sổ kh
 
 - *Nguồn tổng hợp* (mặc định): app tự sinh xe, radar và IMU.
 - *Radar ghi thực*: bấm **Nhập CSV / log D/E**, chọn file, và chọn radar thuộc (LEFT/RIGHT) **trước** khi nhập.
+- *IMU ghi thực (BMI160)*: bấm **Nhập log IMU (BMI160)** để dùng log IMU thật thay cho IMU giả lập. Xem mục 1.6.
 
 **Bước 4 — Chạy.** Chọn kịch bản, bấm **Bắt đầu / Reset phiên**. Theo dõi hai panel bên phải:
 
@@ -100,6 +105,51 @@ Push-Location tools/rideguard-simulator
 
 Pop-Location
 ```
+
+### 1.6. Nạp log IMU BMI160 (ghi thực)
+
+Bấm **Nhập log IMU (BMI160)** trong nhóm *2 · NGUỒN / ĐIỀU KHIỂN*. File CSV phải có các cột:
+
+```
+timestamp_us,ax_raw,ay_raw,az_raw,gx_raw,gy_raw,gz_raw,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,temperature_C
+```
+
+App làm gì với từng cột:
+
+| Cột | Xử lý |
+|---|---|
+| `timestamp_us` | đổi sang **ms tương đối** so với mẫu đầu; mẫu trùng ms được lượng tử tiếp để timestamp tăng nghiêm ngặt |
+| `ax_g,ay_g,az_g` | **× 9.80665** → m/s². Giữ trọng lực: đứng yên ngang là `(0, 0, 9.80665)` |
+| `gx_dps,gy_dps,gz_dps` | **giữ nguyên**, đã là °/s |
+| `ax_raw…gz_raw` | **không dùng** |
+| `temperature_C` | chỉ để tham khảo, không ảnh hưởng cảnh báo |
+
+**Vì sao không dùng cột RAW?** RAW là số LSB. Muốn ra m/s² hoặc °/s thì phải có full-scale và sensitivity thật của BMI160 trên board của bạn, cộng thêm calibration. Chưa có thì app **không đoán** — nó bỏ qua cột RAW và ghi rõ trong panel IMU.
+
+**Chọn đúng chiều lắp.** Combo **Gắn BMI160**:
+
+| Lựa chọn | Ý nghĩa |
+|---|---|
+| `identity` | cảm biến X/Y/Z đã là X tiến / Y trái / Z lên của xe |
+| `xyz<-x,z,y` | board nằm ngang: X xe ← Z cảm biến, Y xe ← Z cảm biến, Z xe ← Y cảm biến |
+| `xyz<-x,-y,z` | đảo chiều trục Y của cảm biến |
+| `identity,yaw=-1` | cảm biến úp ngược, đảo chiều yaw |
+
+Chọn sai thì cảnh báo bị **lật trái↔phải**. `gz_dps > 0` chỉ có nghĩa "yaw sang trái" **sau khi** đã xác nhận chiều lắp; gyro đo vận tốc góc, không phải góc ghi đông.
+
+**Hai log dùng hai đồng hồ khác nhau.** Ô **Lệch đồng hồ IMU** (ms) dịch đồng hồ IMU sang đồng hồ radar; mặc định 0. Không tự coi hai mốc bằng nhau chỉ vì cùng đơn vị ms — bạn phải canh bằng tay.
+
+Kiểm chứng bằng script (cần board thật):
+
+```powershell
+Push-Location tools/rideguard-simulator
+& .venv/Scripts/python.exe -X utf8 hardware_imu_import.py --port COM5 `
+    --radar ../samples/generated/left_approach_multi_45s_dual.csv `
+    --imu ../samples/generated/imu_bmi160_45s.csv --mount identity
+Pop-Location
+```
+
+Kết quả kỳ vọng: `filtered_yaw_dps` khớp `gz_dps` trong file, `motion=LEFT`, có `TURN_TOWARD_NEAR_TARGET` (HIGH), `parser_errors=0`, không `IMU_STALE`.
 
 ---
 
@@ -320,6 +370,10 @@ Khi cấu hình vượt ngân sách, app **báo lỗi và từ chối bắt đ�
 | **Nhập CSV / log D/E** | Nạp radar đã ghi. Hỗ trợ CSV nhóm theo ms/frame/radar và log D/E của Hi-Link |
 | **Về mô phỏng tổng hợp** | Bỏ chế độ replay, quay lại dữ liệu do app sinh |
 | **Replay + IMU giả lập** | Bật IMU giả khi phát lại radar ghi thực. **Chưa đồng bộ** với dữ liệu CSV |
+| **Gắn BMI160** | Cách gắn cảm biến: trục cảm biến → trục xe (X tiến, Y trái, Z lên). Xem mục 1.6 |
+| **Lệch đồng hồ IMU** | Dịch đồng hồ log IMU sang đồng hồ log radar, tính bằng ms. Mặc định 0 |
+| **Nhập log IMU (BMI160)** | Nạp log IMU thật để thay cho IMU giả lập. Xem mục 1.6 |
+| **Bỏ log IMU** | Quay lại IMU giả lập |
 | **Tốc độ thời gian** | 0.5× / 1× / 2× — xem bảng ngân sách ở mục 3.2c |
 | **Bắt đầu / Reset phiên** | Mở phiên mới, xóa toàn bộ trạng thái cũ trên board, gửi cấu hình + tham số mới |
 | **Tạm dừng / Chạy tiếp** | PAUSE / RESUME, đều chờ ACK. Khi PAUSED kết quả là `UNKNOWN / PAUSED` |
@@ -366,5 +420,6 @@ Khi cấu hình vượt ngân sách, app **báo lỗi và từ chối bắt đ�
 |---|---|
 | [`contracts/sensor-simulation.md`](../../contracts/sensor-simulation.md) | Đặc tả giao thức đầy đủ (envelope, miền giá trị, ngưỡng) |
 | [`docs/testing/simulator-2026-11-17.md`](../../docs/testing/simulator-2026-11-17.md) | Báo cáo kiểm chứng 13/13 trên phần cứng thật |
+| [`docs/testing/simulator-result-timing-2026-11-17.md`](../../docs/testing/simulator-result-timing-2026-11-17.md) | Báo cáo đo nhịp RESULT + importer IMU BMI160 (lượt tối) |
 | [`README.md`](README.md) | Mô tả tổng quan + runbook ngắn |
 | [`contracts/ble-protocol.md`](../../contracts/ble-protocol.md) | Giao thức BLE navigation (giữ nguyên, không bị ảnh hưởng) |

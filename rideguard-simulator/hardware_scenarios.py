@@ -23,7 +23,13 @@ def exercise(session,index,duration=6,speed=1):
     session.start(index)
     wait(session,lambda:session.pending is None and session.state=='RUNNING')
     results=[];last_seq=0;start=time.monotonic()
+    # Drive the session on the simulation clock, but bound the run with wall
+    # time as well: ``world.t`` stops advancing whenever the session is
+    # waiting for an ACK, which would otherwise spin here forever.
+    wall_deadline=start+duration/speed+5
     while session.world.t<duration:
+        if time.monotonic()>wall_deadline:
+            break
         deadline=start+(session.world.t+.01)/speed
         session.step()
         while time.monotonic()<deadline:
@@ -31,8 +37,12 @@ def exercise(session,index,duration=6,speed=1):
         r=session.visible_result()
         if r and r['seq']>last_seq:
             results.append(r);last_seq=r['seq']
-        assert session.state=='RUNNING',session.events[-3:]
-    session.command('SESSION_STOP','STOPPED')
+        # A replay ends itself at EOF, so the session can legitimately stop
+        # before the requested duration.
+        if session.state!='RUNNING' or session.replay_finished:
+            break
+    if session.state=='RUNNING' and session.pending is None:
+        session.command('SESSION_STOP','STOPPED')
     wait(session,lambda:session.pending is None and session.state=='STOPPED')
     assert results,'No real RESULT frames'
     return results,str(session.log_path)
@@ -46,18 +56,26 @@ def settled(results):
     UNKNOWN/NO_SESSION. Both are correct behaviour, so they must not be
     mistaken for a sensor fault in the middle of a run.
 
-    A startup frame is one where no sensor has ever been valid; a teardown
-    frame carries NO_SESSION. Everything else is a real observation and is
-    kept, including mid-run IMU_STALE / RADAR_STALE.
+    A *startup* frame is one that arrives before every sensor has been seen
+    valid at least once.  That is decided from the order of the frames, not
+    from the current ``valid`` flags: a flag says "is it valid now", and the
+    first RESULT legitimately shows a sensor as not-yet-valid even though
+    another sensor already is.  Once every sensor has been valid, a later
+    UNKNOWN is a real observation and is kept.
     """
     keep=[]
+    ever_valid=False
     for r in results:
         if r['left']['level']!='UNKNOWN':
+            sensors=r.get('sensors') or {}
+            if any(sensors.get(name,{}).get('valid') for name in ('IMU','LEFT','RIGHT')):
+                ever_valid=True
             keep.append(r);continue
         reason=r['left']['reason_code']
-        sensors=r.get('sensors') or {}
-        never_valid=not any(sensors.get(name,{}).get('valid') for name in ('IMU','LEFT','RIGHT'))
-        if reason=='NO_SESSION' or (never_valid and reason in ('IMU_STALE','RADAR_STALE','LINK_STALE')):
+        if reason=='NO_SESSION':
+            continue
+        if not ever_valid and reason in ('IMU_STALE','RADAR_STALE','LINK_STALE'):
+            # Still starting up: not every sensor has been seen yet.
             continue
         keep.append(r)
     return keep
@@ -82,14 +100,48 @@ def run(port,log_dir):
                 # the end. HIGH therefore belongs to whichever side the ego is
                 # turning towards once a target is inside the near zone.
                 assert 'HIGH' in levels['left']|levels['right'],levels
+                # A HIGH frame must either be turning towards that side, or be
+                # inside the hold window: the firmware keeps HIGH for
+                # ``hold_ms`` after the yaw falls back below the threshold,
+                # so a turning-towards frame can be followed by held frames
+                # whose motion has already returned to STRAIGHT.
+                hold_ms=session.rules.get('hold_ms',350)
                 for frame in live:
-                    if frame['left']['level']=='HIGH':
-                        assert frame['motion']=='LEFT',frame
-                    if frame['right']['level']=='HIGH':
-                        assert frame['motion']=='RIGHT',frame
+                    for side,turn in (('left','LEFT'),('right','RIGHT')):
+                        if frame[side]['level']!='HIGH':
+                            continue
+                        if frame['motion']==turn:
+                            continue
+                        # Held frame: there must be an earlier, turning-towards
+                        # HIGH frame within the hold window on this side.
+                        origin=[f for f in live
+                                if f[side]['level']=='HIGH' and f['motion']==turn
+                                and f['t_ms']<=frame['t_ms']
+                                and frame['t_ms']-f['t_ms']<=hold_ms]
+                        assert origin,('HIGH without a turning-towards cause',frame)
             if index==1:assert levels['left']==levels['right']=={'NONE'},levels
             if index==2:assert levels['left']=={'MONITOR'} and levels['right']=={'NONE'},levels
             if index==3:assert levels['right']=={'MONITOR'} and levels['left']=={'NONE'},levels
+            if index in (0, 4, 5):
+                # A warning must mean the vehicle is actually angled towards
+                # the warned side.  During a lane change the yaw *rate* flips
+                # halfway through while the heading offset keeps its sign, so
+                # warning on the opposite side there would flag a vehicle
+                # that is merely straightening up.
+                for frame in live:
+                    heading=frame.get('heading_deg')
+                    assert heading is not None,('firmware thiếu heading_deg',frame)
+                    if frame['left']['level']=='HIGH':
+                        assert heading>0,('HIGH trái khi xe không nghiêng trái',frame)
+                    if frame['right']['level']=='HIGH':
+                        assert heading<0,('HIGH phải khi xe không nghiêng phải',frame)
+            if index==5:
+                # The ego changes lane to the left, so the heading offset is
+                # positive for the whole manoeuvre.  A right-side warning
+                # could only come from the rate flipping back, which is
+                # exactly the false alarm this rule removes.
+                assert all(r['right']['level']!='HIGH' for r in live), \
+                    [r for r in live if r['right']['level']=='HIGH'][:3]
             if index==4:
                 # Initial outward part; return steering is separately visible.
                 assert all(r['left']['level']!='HIGH' for r in live if 2000<r['t_ms']<3900)
@@ -125,7 +177,8 @@ def run(port,log_dir):
                                result_frames=len(results),log=path))
             print(f'PASS primary {speed}x (radar {period} ms, imu {imu_period} ms)',flush=True)
         session.imu_period_ms=10
-        session.replay=load(Path(__file__).parent/'samples/radar_recorded_excerpt.csv','LEFT')
+        # Recordings live next to the tool: <repo>/tools/samples/.
+        session.replay=load(Path(__file__).parent.parent/'samples/radar_recorded_excerpt.csv','LEFT')
         results,path=exercise(session,0,1.5)
         assert any(any(t['track_id']==31 for t in r['targets']) for r in results)
         assert all(r['left']['level']=='UNKNOWN' for r in results)
