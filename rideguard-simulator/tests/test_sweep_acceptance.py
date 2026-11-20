@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from hardware_scenarios import settled
+from scripts.testing.hardware_scenarios import settled
 
 
 def result(t_ms, level, reason, valid=('IMU', 'LEFT', 'RIGHT')):

@@ -17,11 +17,13 @@ def load_trusted(repo,config_path):
     if hashlib.sha256(path.read_bytes()).hexdigest()!=manifest['sha256']:
         raise ValueError('MODEL_HASH: artifact damaged or not the trusted build')
     bundle=joblib.load(path)  # only our locally generated artifact; not a user upload
-    if bundle['schema']!=config['schema'] or bundle['features']!=list(FEATURES) or bundle['config']!=config:
+    base_config={k:v for k,v in config.items() if k!='postprocess'}
+    if bundle['schema']!=config['schema'] or bundle['features']!=list(FEATURES) or bundle['config']!=base_config:
         raise ValueError('MODEL_SCHEMA: schema/config/feature order mismatch; train a new artifact')
     if set(bundle['model'].classes_)!={'NONE','MONITOR','HIGH'}:
         raise ValueError('MODEL_CLASSES: unsupported class mapping')
     if hasattr(bundle['model'],'n_jobs'):bundle['model'].n_jobs=1
+    bundle['postprocess']=config.get('postprocess')
     return bundle
 
 
@@ -29,17 +31,40 @@ class Engine:
     def __init__(self,bundle,session_id):
         self.bundle=bundle;self.session_id=session_id;self.features=Features(bundle['config'])
         self.next_us=0;self.count=0;self.digest=hashlib.sha256();self.last_us=-1
+        self.high_run={'left':0,'right':0}
 
     def _predict(self,stamp):
         start=time.perf_counter_ns();pairs=[self.features.at(stamp,s) for s in ('LEFT','RIGHT')]
         levels={};ready=[i for i,(_,reason) in enumerate(pairs) if reason=='READY']
         predictions={};probabilities={}
+        post=self.bundle.get('postprocess') or {}
+        theta=post.get('high_threshold')
+        persist_k=int(post.get('persistence_ticks',1) or 1)
         if ready:
             model=self.bundle['model'];x=[pairs[i][0] for i in ready]
+            classes=[str(c) for c in model.classes_]
             for i,p,proba in zip(ready,model.predict(x),model.predict_proba(x)):
-                predictions[i]=str(p);probabilities[i]={str(k):float(v) for k,v in zip(model.classes_,proba)}
+                scores={str(k):float(v) for k,v in zip(classes,proba)}
+                probabilities[i]=scores
+                if theta is None:
+                    predictions[i]=str(p)
+                else:
+                    if scores.get('HIGH',0.)>=float(theta):
+                        predictions[i]='HIGH'
+                    else:
+                        nonhigh=[c for c in classes if c!='HIGH']
+                        predictions[i]=max(nonhigh,key=lambda c:scores.get(c,0.))
         for i,side in enumerate(('left','right')):
-            levels[side]=dict(level=predictions.get(i,'UNKNOWN'),reason_code=pairs[i][1],scores=probabilities.get(i,{}))
+            level=predictions.get(i,'UNKNOWN')
+            if level=='HIGH':
+                self.high_run[side]+=1
+                if self.high_run[side]<persist_k:
+                    scores=probabilities.get(i,{})
+                    nonhigh=[c for c in scores if c!='HIGH']
+                    level=max(nonhigh,key=lambda c:scores.get(c,0.)) if nonhigh else 'MONITOR'
+            else:
+                self.high_run[side]=0
+            levels[side]=dict(level=level,reason_code=pairs[i][1],scores=probabilities.get(i,{}))
         return dict(type='AI',session_id=self.session_id,t_ms=stamp//1000,**levels,
                     sensor_count=self.count,stream_sha256=self.digest.hexdigest(),inference_ms=(time.perf_counter_ns()-start)/1e6)
 

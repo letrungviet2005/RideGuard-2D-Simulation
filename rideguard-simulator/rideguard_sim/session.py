@@ -48,6 +48,12 @@ class Session:
         self.sensor_observer = None
         self.result_observer = None
         self.sensor_batch = []
+        # Legacy programmatic callers retain hardware mode; Window defaults to PC.
+        self.rule_source='esp32';self.pc_rules=None;self.applied_rules={}
+        self.capabilities={};self.applied_firmware=None
+        self.imu_mode='auto';self.manual_gz=0.;self.next_rule=0;self.rule_wall=0
+        self.initial_setups={}
+        self.steer_sensitivity=1.
 
     def record(self, direction, message):
         if self.log:
@@ -57,6 +63,8 @@ class Session:
             self.events = self.events[-100:]
 
     def send(self, kind, t_ms=None, **fields):
+        if kind=='IMU' and self.imu_mode=='manual' and not (self.replay or self.dataset or self.imu_recording):
+            fields=dict(fields,gz_dps=self.manual_gz)
         message = self.envelope.make(kind, round(self.world.t*1000) if t_ms is None else t_ms, **fields)
         self.mark('generated', message)
         self.record('TX' if self.link else 'OFFLINE', message)
@@ -86,8 +94,18 @@ class Session:
     def publish_sensors(self):
         events=tuple(sorted(self.sensor_batch,key=lambda e:(e.timestamp_us,e.kind,e.payload)))
         self.sensor_batch.clear()
+        if self.rule_source=='pc' and self.pc_rules:
+            for event in events:self.pc_rules.ingest(event)
+            if self.world.t*1000>=self.next_rule:
+                self.next_rule=round(self.world.t*1000)+50
+                self.emit_pc_result()
         if self.sensor_observer:
             self.sensor_observer(events,round(self.world.t*1000000))
+
+    def emit_pc_result(self):
+        self.result=self.pc_rules.result();self.result_wall=self.rule_wall=time.monotonic()
+        self.record('RULE_PC',self.result)
+        if self.result_observer:self.result_observer(self.result)
 
     def mark(self, stage, message=None, **fields):
         trace = getattr(self.link, 'trace', None)
@@ -110,16 +128,30 @@ class Session:
     def start(self, scenario=0):
         if self.pending:
             raise ValueError('Đang chờ ACK')
+        from .pc_rules import validate_rules, YELLOW_UNSUPPORTED, PcRules
+        validate_rules(self.rules)
+        if self.rule_source=='pc' and self.link:raise ValueError('Đóng COM trước khi chạy bộ luật PC')
+        if self.rule_source=='esp32' and self.rules.get('yellow_mode')=='distance' and not self.capabilities.get('yellow_distance_v1'):
+            raise ValueError(YELLOW_UNSUPPORTED)
         self.preflight()
+        self.historical_no_geometry=False
+        self.reviewing_history=False
+        self.manual_gz=0.;self.applied_rules=self.rules.copy();self.applied_firmware=None
         self.live_imu_rows=[];self.live_imu_overflow=False
         if self.log:
             self.log.close()
         self.envelope = Envelope()
         self.sensor_batch=[]
+        self.next_rule=0
+        self.pc_rules=PcRules(self.applied_rules,self.envelope.session) if self.rule_source=='pc' else None
         if self.dataset:self.dataset.reset()
         self.log_path = self.log_dir / f'{time.strftime("%Y%m%d-%H%M%S")}-{self.envelope.session[:8]}.jsonl'
         self.log = self.log_path.open('w', encoding='utf-8', buffering=1)
         self.world = scenarios.create(scenario)
+        if not (self.dataset or self.replay or self.imu_recording):
+            from .vehicle_setup import apply_setup
+            apply_setup(self.world,self.initial_setups.get(scenario,{}))
+        self.world.ego.steer_sensitivity=self.steer_sensitivity
         if self.replay:
             self.world.targets=[]
             if not self.replay_imu:
@@ -135,9 +167,13 @@ class Session:
         self.result = None
         self.last_sent = {}
         self.record('META', {'type':'CONFIG', 'seed':17, 'scenario':scenario, 'radar':vars(self.radar.config),
-                             'rules':self.rules, 'mode':'recorded' if self.replay else 'synthetic',
+                             'rules':self.applied_rules,'rule_source':self.rule_source,
+                             'rule_version':'pc-port-2' if self.rule_source=='pc' else self.capabilities.get('rule_version','unknown'),
+                             'imu_mode':self.imu_mode,'manual_gz_initial':0,
+                             'mode':'recorded' if self.replay else 'synthetic',
                              'replay_imu':self.replay_imu,
                              'replay_source':self.replay.source if self.replay else None})
+        self.record('META',dict(type='INITIAL_VEHICLES',vehicles=self.initial_setups.get(scenario,{}),steer_sensitivity=self.steer_sensitivity))
         if self.replay:
             self.record('META', {'type':'RECORDED_SOURCE','raw':self.replay.raw})
         if self.imu_recording is not None:
@@ -148,7 +184,10 @@ class Session:
                                  'samples':len(self.imu_recording.samples),
                                  'notes':self.imu_recording.notes,
                                  'raw':self.imu_recording.raw})
-        self.command('SESSION_START', 'RUNNING', rules=self.rules,
+        wire_rules=self.applied_rules.copy()
+        if self.rule_source=='esp32' and not self.capabilities.get('yellow_distance_v1'):
+            wire_rules.pop('yellow_mode',None);wire_rules.pop('yellow_m',None)
+        self.command('SESSION_START', 'RUNNING', rules=wire_rules,
                      timing_legacy=getattr(self, 'timing_legacy', False))
 
     def load_replay(self, path, radar_id, rebase=True):
@@ -249,8 +288,13 @@ class Session:
             self.pending = (command, message['seq'], next_state, time.monotonic())
         else:
             self.state = next_state
+            if self.rule_source=='pc' and self.pc_rules:
+                self.pc_rules.control(command);self.emit_pc_result()
 
     def poll(self):
+        if self.rule_source=='pc':
+            if self.pc_rules and time.monotonic()-self.rule_wall>=.1:self.emit_pc_result()
+            return
         if not self.link:
             return
         if self.link.error:
@@ -264,7 +308,27 @@ class Session:
             if message.get('session_id') != self.envelope.session or message.get('protocol_version') != 1:
                 continue
             kind = message.get('type')
+            if kind=='CAPABILITIES':
+                self.capabilities=message
+                continue
+            if kind=='ERROR' and message.get('command')=='GET_CAPABILITIES':
+                self.capabilities={'yellow_distance_v1':False,'rule_version':'unknown/legacy'}
+                self.events.append('Firmware cũ: không có capability ngưỡng vàng; vẫn dùng chế độ vàng cũ')
+                continue
             if kind == 'ACK' and self.pending and (message.get('command'),message.get('seq')) == self.pending[:2]:
+                if self.pending[0]=='SESSION_START' and self.applied_rules.get('yellow_mode')=='distance':
+                    applied=message.get('applied_rules')
+                    from .pc_rules import confirms_rules
+                    if not message.get('yellow_distance_v1') or not confirms_rules(applied,self.applied_rules):
+                        self.events.append('Firmware không xác nhận đúng ngưỡng đã yêu cầu; đóng kết nối')
+                        self.disconnect();return
+                if self.pending[0]=='SESSION_START':
+                    self.applied_firmware=message.get('applied_rules',self.applied_rules.copy())
+                    if not message.get('yellow_distance_v1'):
+                        self.applied_firmware.pop('yellow_mode',None);self.applied_firmware.pop('yellow_m',None)
+                    self.record('META',dict(type='FIRMWARE_APPLIED',rule_source='esp32',
+                        rule_version=message.get('rule_version','unknown'),applied_rules=self.applied_firmware,
+                        extended_confirmed=bool(message.get('yellow_distance_v1'))))
                 self.state = self.pending[2]
                 self.pending = None
             elif kind == 'ERROR':
@@ -286,9 +350,77 @@ class Session:
             self.disconnect()
 
     def visible_result(self):
-        if not self.link or self.state == 'ERROR' or time.monotonic()-self.result_wall>1:
+        if (self.rule_source=='esp32' and not self.link) or self.state == 'ERROR' or time.monotonic()-self.result_wall>1:
             return None
         return self.result
+
+    def vehicle_edit_reason(self, *, paused=True):
+        if getattr(self,'reviewing_history',False) or getattr(self,'historical_no_geometry',False):
+            return 'Xem lại lịch sử chỉ đọc; Bắt đầu/Reset phiên mới để chỉnh xe.'
+        if self.dataset or self.replay or self.imu_recording:
+            return 'CSV/dataset chỉ đọc; Nạp kịch bản tổng hợp rồi Bắt đầu để chỉnh xe.'
+        if self.pending:return 'Đang chờ ACK; chờ xác nhận trước khi chỉnh xe.'
+        if paused and self.state!='PAUSED':return 'Bấm Tạm dừng và chờ PAUSED để chỉnh xe.'
+        if not paused and self.state not in ('RUNNING','PAUSED'):return 'Bắt đầu phiên tổng hợp trước khi ra lệnh quỹ đạo.'
+        return ''
+
+    def steer_reason(self):
+        """Why live EGO steering is unavailable ('' when allowed).
+
+        Deliberately weaker than ``vehicle_edit_reason()`` (paused=True):
+        steering works while RUNNING.  Coordinate/speed edits and mouse drags
+        keep their own PAUSED requirement.
+        """
+        reason=self.vehicle_edit_reason(paused=False)
+        if reason:
+            return reason
+        if self.imu_mode=='manual':
+            return 'Đang thử gyro Z bằng tay; chọn "IMU theo chuyển động EGO" để lái EGO thật.'
+        return ''
+
+    def _steer_meta(self,kind,**fields):
+        ego=self.world.ego
+        self.record('META',dict(type=kind,t_ms=round(self.world.t*1000),steer=ego.steer,
+            x=ego.x,y=ego.y,heading_rad=ego.heading,speed_mps=ego.speed,**fields))
+
+    def steer(self,value):
+        reason=self.steer_reason()
+        if reason:
+            raise ValueError(reason)
+        ego=self.world.ego
+        takeover=ego.control!='manual'
+        before=ego.steer
+        ego.set_steer(value)
+        if takeover:
+            self._steer_meta('EGO_TAKEOVER',lane_cancelled=True)
+        if ego.steer!=before or takeover:
+            self._steer_meta('EGO_STEER',command=ego.steer)
+
+    def release_ego(self):
+        """Explicitly give EGO back to the scheduled scenario."""
+        reason=self.steer_reason()
+        if reason:
+            raise ValueError(reason)
+        self.world.ego.release_to_scenario()
+        self._steer_meta('EGO_RELEASE_TO_SCENARIO')
+
+    def driver_text(self):
+        """One line for the UI: who drives EGO and where the data comes from."""
+        if self.dataset:
+            return f"Nguồn: Dataset {self.dataset.meta['session_id']} | EGO: phát lại, khóa lái"
+        if self.replay:
+            kind='CSV radar + IMU' if self.imu_recording else 'CSV radar'
+            return f'Nguồn: {kind} | EGO: phát lại, khóa lái'
+        if self.imu_recording:
+            return 'Nguồn: CSV IMU + radar tổng hợp | EGO: khóa lái (IMU ghi sẵn)'
+        ego=self.world.ego
+        if ego.control=='manual':
+            side='phải' if ego.steer<0 else 'trái' if ego.steer>0 else 'giữa (giữ hướng hiện tại)'
+            driver=f'Tay lái trực tiếp · {side}'+(f' {abs(ego.steer)*100:.0f}%' if ego.steer else '')
+        else:
+            driver='Theo kịch bản'
+        changed=self.initial_setups.get(self.scenario) or any(c.manual_fields for c in [ego,*self.world.targets])
+        return f'Nguồn: Tình huống dựng sẵn | EGO: {driver}'+(' | Chưa có nhãn cho quỹ đạo đã chỉnh' if changed else '')
 
     def step(self,dt=.01):
         if self.state != 'RUNNING' or self.pending:
@@ -343,12 +475,14 @@ class Session:
         self.publish_sensors()
 
     def disconnect(self):
+        if self.pc_rules:self.pc_rules.control('SESSION_STOP')
         if self.link:
             self.link.close()
         self.link = None
         self.result = None
         self.pending = None
         self.state = 'STOPPED'
+        self.capabilities={};self.applied_firmware=None
 
     def close(self):
         self.disconnect()

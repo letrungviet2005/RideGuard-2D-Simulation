@@ -15,14 +15,17 @@ def test_comparison_keeps_one_session_geometry_and_no_fake_esp32(tmp_path):
     try:
         window.timer.stop();window.panel_timer.stop()
         window.show();APP.processEvents()
-        assert window.ai_road.isHidden()
+        # Two frames stay mounted even before inference is enabled (stable UI).
+        assert not window.ai_road.isHidden()
+        geometry=window.road.geometry(),window.ai_road.geometry(),window.timeline_area.geometry()
         window.compare.setChecked(True);APP.processEvents()
         assert not window.ai_road.isHidden()
+        assert geometry==(window.road.geometry(),window.ai_road.geometry(),window.timeline_area.geometry())
         assert window.road.session is window.ai_road.session is window.session
-        assert window.road.caption=='Bộ luật · ESP32' and window.ai_road.caption=='AI · Máy tính'
+        assert window.road.caption=='Bộ luật · Máy tính' and window.ai_road.caption=='AI · Máy tính'
         assert window.session.visible_result() is None and window.ai_road.result_provider() is None
         window.refresh_panels()
-        assert 'Chưa có phản hồi ESP32' in window.reason.text()
+        assert 'Chưa có kết quả · Bộ luật · Máy tính' in window.reason.text()
         assert 'Chưa đủ kết quả' in window.comparison_label.text()
         assert window.road.scale==window.ai_road.scale
         assert not window.grab().isNull()

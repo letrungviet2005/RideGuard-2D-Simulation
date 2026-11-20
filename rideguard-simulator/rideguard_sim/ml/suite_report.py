@@ -25,6 +25,8 @@ def report_suite(repo,config_path,input_dir,output):
         if len(logs)!=1:raise ValueError(f'Expected one raw session log: {sid}')
         rules,ai,session_id=read_log(logs[0]);summary=json.loads((folder/'summary.json').read_text())
         if not rules or not ai:raise ValueError('Missing hardware/model evidence')
+        if any(r.get('type')!='RESULT' or r.get('rule_source','esp32')!='esp32' for r in rules):
+            raise ValueError('Hardware report rejects PC rule evidence')
         if summary['parser_errors_max']!=0 or summary['common_sensor_events']!=summary['actual_sensor_writes']:
             raise ValueError(f'Parser/write failure: {sid}')
         if len({summary[k] for k in ('expected_sha256','pc_sha256','ai_sha256')})!=1:

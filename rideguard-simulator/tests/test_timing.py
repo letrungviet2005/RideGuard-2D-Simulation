@@ -1,5 +1,5 @@
 from rideguard_sim.timing import TimingTrace
-from measure_result_timing import stats, summarize
+from scripts.diagnostics.measure_result_timing import stats, summarize
 
 
 def test_trace_is_bounded_and_reports_loss():

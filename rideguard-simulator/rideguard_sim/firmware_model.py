@@ -66,7 +66,7 @@ class FirmwareModel:
         if entry is None:
             return False
         t = entry[0]
-        return self.now >= t and self.now - t <= STALE_MS
+        return self.now >= t and self.now - t <= self.rules.get('stale', STALE_MS)
 
     def result(self):
         unknown = None
@@ -74,7 +74,7 @@ class FirmwareModel:
             unknown = 'IMU_STALE'
         for radar_id in ('LEFT', 'RIGHT'):
             if not self._fresh(self.radar.get(radar_id)):
-                unknown = 'RADAR_STALE'
+                if unknown is None: unknown = 'RADAR_STALE'
                 break
         if unknown is None:
             motion = 'LEFT' if self.motion == 1 else 'RIGHT' if self.motion == -1 else 'STRAIGHT'
@@ -82,9 +82,12 @@ class FirmwareModel:
             motion = 'UNKNOWN'
 
         seen = {'left': False, 'right': False}
+        yellow = {'left': False, 'right': False}
         high = {'left': False, 'right': False}
         cause = {'left': None, 'right': None}
-        for radar_id, entry in self.radar.items():
+        cause_radar = {'left': '', 'right': ''}
+        for radar_id in ('LEFT','RIGHT'):
+            entry = self.radar.get(radar_id)
             if not self._fresh(entry):
                 continue
             for target in entry[1]:
@@ -93,8 +96,11 @@ class FirmwareModel:
                 body_y = mount_y - target['y_m'] * math.tan(math.radians(target['angle_deg']))
                 side = 'left' if body_y >= 0 else 'right'
                 seen[side] = True
+                if self.rules.get('yellow_mode','detected')=='detected' or target['y_m']<=self.rules.get('yellow_m',15):
+                    yellow[side] = True
                 if cause[side] is None:
                     cause[side] = target['track_id']
+                    cause_radar[side] = radar_id
                 # The rate alone is not enough: in the second half of a lane
                 # change the rate points back while the vehicle is still
                 # angled towards the first side.  The heading offset must
@@ -106,6 +112,7 @@ class FirmwareModel:
                 if danger:
                     high[side] = True
                     cause[side] = target['track_id']
+                    cause_radar[side] = radar_id
 
         out = {}
         for side in ('left', 'right'):
@@ -117,10 +124,11 @@ class FirmwareModel:
                     self.high_until[side] = self.now + self.rules['hold']
                 held = seen[side] and self.now < self.high_until[side]
                 out[side] = dict(
-                    level='HIGH' if held else 'MONITOR' if seen[side] else 'NONE',
+                    level='HIGH' if held else 'MONITOR' if yellow[side] else 'NONE',
                     reason_code='TURN_TOWARD_NEAR_TARGET' if held else
-                                'TARGET_IN_ZONE' if seen[side] else 'EMPTY_VALID_FRAMES',
+                                'TARGET_IN_ZONE' if yellow[side] else 'TARGET_OUTSIDE_YELLOW' if seen[side] else 'EMPTY_VALID_FRAMES',
                     track_id=cause[side])
+            out[side]['radar_id']=cause_radar[side]
         return out, motion, self.filtered_yaw
 
 

@@ -10,14 +10,14 @@ import time
 
 
 class Bridge:
-    def __init__(self,repo,session_id):
+    def __init__(self,repo,session_id,config_rel='ai/configs/sensor-lab.json'):
         self.session_id=session_id;self.error=None;self.ready=False;self.closed=False
         self.tx=queue.Queue(maxsize=256);self.rx=queue.Queue(maxsize=512)
         self.latest=None;self.latest_wall=0;self.history=deque(maxlen=1000);self.peak_queue=0
         self.checkpoint=None;self.recorded_checkpoint=None
         repo=Path(repo);python=repo/'ai/.venv/Scripts/python.exe'
         if not python.exists():python=repo/'ai/.venv/bin/python'
-        self.process=subprocess.Popen([str(python),'-X','utf8',str(repo/'ai/sensor_lab.py'),'worker'],
+        self.process=subprocess.Popen([str(python),'-X','utf8',str(repo/'ai/sensor_lab.py'),'worker','--config',config_rel],
              stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding='utf-8',bufsize=1,
              creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
         self.threads=[threading.Thread(target=f,daemon=True) for f in (self._write,self._read,self._errors)]

@@ -11,8 +11,8 @@ class ComparisonTimeline(QWidget):
 
     def __init__(self):
         super().__init__();self.rows=[];self.end_ms=50;self.cursor_ms=None
-        self.setMinimumHeight(240);self.setMouseTracking(True);self.bands=[]
-        self.enabled_review=False
+        self.setFixedHeight(140);self.setMouseTracking(True);self.bands=[]
+        self.enabled_review=False;self.rule_caption='ESP32 thật'
 
     def set_rows(self,rows):
         self.rows=rows;self.end_ms=max([50,*[r['timestamp_ms']+50 for r in rows]])
@@ -39,22 +39,22 @@ class ComparisonTimeline(QWidget):
 
     def mouseMoveEvent(self,event):
         stamp=self.stamp_at(event.position().x());rows=[r for r in self.rows if r['timestamp_ms']==stamp]
-        detail='\n'.join(f"{r['side']}: ESP32={r['esp32'] or '?'} · AI={r['ai'] or '?'} · Nhãn={r['label'] or '?'}" for r in rows)
+        detail='\n'.join(f"{r['side']}: {self.rule_caption}={r['esp32'] or '?'} · AI={r['ai'] or '?'} · Nhãn={r['label'] or '?'}" for r in rows)
         QToolTip.showText(event.globalPosition().toPoint(),f'{stamp/1000:.2f} s\n'+detail,self)
 
     def paintEvent(self,event):
         p=QPainter(self);p.fillRect(self.rect(),QColor('#0c1622'));p.setRenderHint(QPainter.Antialiasing)
-        left=160;width=max(1,self.width()-180);top=30;row_h=24
-        labels={'esp32':'ESP32','ai':'AI','label':'Nhãn tham chiếu','disagreement':'Khác nhau'}
+        left=160;width=max(1,self.width()-180);top=22;row_h=14
+        labels={'esp32':self.rule_caption,'ai':'AI','label':'Nhãn tham chiếu','disagreement':'Khác nhau'}
         for tick in range(0,self.end_ms+1,5000):
             x=left+tick/self.end_ms*width;p.setPen(QColor('#35475b'));p.drawLine(int(x),top,int(x),top+8*row_h)
             p.setPen(QColor('#b9c9d8'));p.drawText(int(x)-10,19,f'{tick/1000:g}s')
         for i,(side,source,runs) in enumerate(self.bands):
             y=top+i*row_h;p.setPen(QColor('#d7e6ef'))
-            p.drawText(5,y+15,('Trái ' if side=='left' else 'Phải ')+labels[source])
+            p.drawText(5,y+11,('Trái ' if side=='left' else 'Phải ')+labels[source])
             for start,end,value in runs:
                 color=('#f96f91' if value is True else '#243c4c' if value is False else '#554969') if source=='disagreement' else COLORS[value]
-                rect=QRectF(left+start/self.end_ms*width,y,(end-start)/self.end_ms*width,17)
+                rect=QRectF(left+start/self.end_ms*width,y,(end-start)/self.end_ms*width,11)
                 p.fillRect(rect,QColor(color))
                 if value is None:
                     p.fillRect(rect,QBrush(QColor('#b1a6c9'),Qt.Dense6Pattern))

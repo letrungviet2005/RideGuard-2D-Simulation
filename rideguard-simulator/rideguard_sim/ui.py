@@ -9,7 +9,7 @@ from datetime import datetime
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QComboBox, QDoubleSpinBox, QSpinBox, QFormLayout, QGroupBox,
-    QPlainTextEdit, QFileDialog, QMessageBox, QCheckBox, QSplitter, QScrollArea)
+    QPlainTextEdit, QFileDialog, QMessageBox, QCheckBox, QSplitter, QScrollArea, QTabBar, QStackedWidget)
 from .session import Session
 from .serial_link import SerialLink, ports
 from .protocol import BAUD, budget_bytes_per_second
@@ -17,14 +17,18 @@ from .scene import RoadView
 from . import scenarios, replay, imu_import
 from .imu_plot import ImuPlot
 from .comparison_timeline import ComparisonTimeline
+from .control_panel import build_pages, install_wheel_guard, open_field_guide
 
 
 class Window(QMainWindow):
+    STEER_BUTTON_LEVEL=.6  # hold-buttons; arrow keys use full lock (1.0); slider any level
     def __init__(self, log_dir):
         super().__init__()
         self.setWindowTitle('RideGuard • Phòng mô phỏng 2D / ESP32')
-        self.resize(1460,900)
+        self.resize(1366,768)
         self.session=Session(log_dir)
+        self.session.rule_source="pc";self.capabilities_asked=False
+        self.vehicle_dirty=set();self.vehicle_form_loading=False;self.vehicle_form_id=None
         self.error_log_path=self.session.log_dir/f'app-errors-{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:8]}.jsonl'
         self.imu_import_attempt=None
         self.repo=Path(__file__).resolve().parents[3]
@@ -38,6 +42,8 @@ class Window(QMainWindow):
             QGroupBox::title {subcontrol-origin:margin;left:10px;color:#74d3cb;}
             QPushButton,QComboBox,QDoubleSpinBox,QSpinBox {background:#20354a;border:1px solid #3a526b;border-radius:5px;padding:6px;}
             QPushButton:hover {background:#31556a;} QPushButton:disabled {color:#718394;}
+            QTabBar::tab {background:#20354a;padding:7px;border:1px solid #3a526b;}
+            QTabBar::tab:selected {background:#31556a;color:#80e1d4;font-weight:600;}
             QPlainTextEdit {background:#0c1622;border:1px solid #35475b;font-family:Consolas;}
             QScrollArea {border:0;}''')
         root=QWidget();outer=QVBoxLayout(root);self.setCentralWidget(root)
@@ -45,111 +51,49 @@ class Window(QMainWindow):
         outer.addWidget(title)
         self.provenance=QLabel('Dữ liệu tổng hợp • mô hình phẳng • không đo độ chính xác an toàn giao thông')
         self.provenance.setWordWrap(True);outer.addWidget(self.provenance)
+        self.control_status=QLabel('Nguồn: Tình huống dựng sẵn | EGO: Theo kịch bản')
+        self.control_status.setStyleSheet('font-weight:700;color:#ffd166;');self.control_status.setWordWrap(True);outer.addWidget(self.control_status)
+        self.tabs=QTabBar();self.tabs.setExpanding(True);self.tabs.setUsesScrollButtons(False)
+        for title in ('Kết nối ESP32','Nguồn & điều khiển','Xe & quỹ đạo','Tham số phiên mới'):self.tabs.addTab(title)
+        outer.addWidget(self.tabs)
+        session_row=QHBoxLayout();outer.addLayout(session_row)
+        self.start_button=QPushButton('Bắt đầu / Reset phiên');self.start_button.clicked.connect(self.start);session_row.addWidget(self.start_button)
+        self.pause_button=QPushButton('Tạm dừng / Chạy tiếp');self.pause_button.clicked.connect(self.pause);session_row.addWidget(self.pause_button)
+        self.stop_button=QPushButton('Dừng phiên');self.stop_button.clicked.connect(lambda:self.safe(lambda:self.session.command('SESSION_STOP','STOPPED')));session_row.addWidget(self.stop_button)
+        self.status=QLabel('STOPPED');session_row.addWidget(self.status,1)
+        self.connection_shortcut=QPushButton('Kết nối ESP32 →');self.connection_shortcut.clicked.connect(lambda:self.tabs.setCurrentIndex(0));session_row.addWidget(self.connection_shortcut)
+        self.session_summary=QLabel();self.session_summary.setWordWrap(True);outer.addWidget(self.session_summary)
         split=QSplitter();outer.addWidget(split,1)
-        left=QWidget();controls=QVBoxLayout(left)
-        scroll=QScrollArea();scroll.setWidgetResizable(True);scroll.setWidget(left);scroll.setMinimumWidth(380);split.addWidget(scroll)
+        self.control_stack=QStackedWidget();self.control_stack.setMinimumWidth(320);split.addWidget(self.control_stack)
+        self.tabs.currentChanged.connect(self.control_stack.setCurrentIndex)
         visual=QWidget();visual_layout=QHBoxLayout(visual);visual_layout.setContentsMargins(0,0,0,0)
         self.road=RoadView(self.session);visual_layout.addWidget(self.road,1)
+        self.road.setMinimumSize(220,200)
+        self.road.caption='Bộ luật · ESP32'
         self.road.result_provider=self.visible_rule
-        self.ai_road=RoadView(self.session);visual_layout.addWidget(self.ai_road,1);self.ai_road.hide()
+        self.ai_road=RoadView(self.session);visual_layout.addWidget(self.ai_road,1);self.ai_road.setMinimumSize(220,200)
         self.ai_road.result_provider=self.visible_ai;self.ai_road.caption='AI · Máy tính'
         self.road.scale_peer=self.ai_road;self.ai_road.scale_peer=self.road
         split.addWidget(visual)
         right=QWidget();panels=QVBoxLayout(right)
-        right_scroll=QScrollArea();right_scroll.setWidgetResizable(True);right_scroll.setWidget(right);right_scroll.setMinimumWidth(310);split.addWidget(right_scroll)
-        split.setSizes([390,700,370])
-        connection=self.group(controls,'1 · KẾT NỐI ESP32')
-        self.port=QComboBox();self.scan_ports();connection.addRow('Cổng',self.port)
-        self.baud=QComboBox();self.baud.addItems(['921600','460800','115200']);connection.addRow('Baud',self.baud)
-        self.button(connection,'Quét cổng',self.scan_ports)
-        self.connect_button=self.button(connection,'Kết nối',self.connect_port)
-        self.connection_label=QLabel('Chỉ mô phỏng · chưa kết nối');self.connection_label.setWordWrap(True);connection.addRow(self.connection_label)
-        mode=self.group(controls,'2 · NGUỒN / ĐIỀU KHIỂN')
-        self.compare=QCheckBox('So sánh Bộ luật / AI');mode.addRow(self.compare)
-        self.compare.toggled.connect(self.toggle_comparison)
-        self.dataset_session=QComboBox();mode.addRow('Dataset session',self.dataset_session)
-        self.dataset_root=self.repo/self.ml_config['dataset']
-        manifest=self.dataset_root/'sessions.json'
-        if manifest.exists():
-            for row in json.loads(manifest.read_text()):
-                self.dataset_session.addItem(f"{row['session_id']} · {row['split']} · {row['scenario']}",row['session_id'])
-        self.button(mode,'Nạp session dataset (radar + IMU)',lambda:self.safe(self.load_dataset,'Nạp dataset'))
-        self.scenario=QComboBox();self.scenario.addItems(scenarios.NAMES);mode.addRow(self.scenario)
-        self.import_radar=QComboBox();self.import_radar.addItems(['LEFT','RIGHT']);mode.addRow('CSV thuộc radar',self.import_radar)
-        self.button(mode,'Nhập CSV / log D/E',self.import_recording)
-        self.button(mode,'Về mô phỏng tổng hợp',self.synthetic)
-        self.synthetic_imu=QCheckBox('Replay + IMU giả lập (chưa đồng bộ)');mode.addRow(self.synthetic_imu)
-        self.imu_profile=QComboBox()
-        self.imu_profile.addItems(['user_table_v1','physical_only'])
-        self.imu_profile.setToolTip('user_table_v1: đúng 14 cột + RAW/unit; hệ số từ bảng người dùng, chưa xác minh phần cứng. physical_only: tương thích log cũ, không kiểm hệ số RAW.')
-        mode.addRow('Profile CSV IMU',self.imu_profile)
-        self.imu_mount=QComboBox()
-        self.imu_mount.addItems(['identity','xyz<-x,z,y','xyz<-x,y,z','xyz<-x,-y,z','identity,yaw=-1'])
-        self.imu_mount.setToolTip('Trục cảm biến → trục xe (X tiến, Y trái, Z lên).\n'
-                                  'Dạng "xyz<-x,z,y": X xe ← X cảm biến, Y xe ← Z, Z xe ← Y.\n'
-                                  'Dấu "-" nghĩa là đảo chiều trục đó; "yaw=-1" đảo chiều yaw.')
-        mode.addRow('Ánh xạ trục IMU',self.imu_mount)
-        self.mount_roll=self.number(mode,'Mount roll (độ)',-180,180,0)
-        self.mount_pitch=self.number(mode,'Mount pitch (độ)',-180,180,0)
-        self.mount_yaw=self.number(mode,'Mount yaw (độ)',-180,180,0)
-        self.imu_offset=QDoubleSpinBox();self.imu_offset.setDecimals(3);self.imu_offset.setRange(-600000,600000);self.imu_offset.setSuffix(' ms')
-        self.imu_offset.setToolTip('Lệch đồng hồ giữa log IMU và log radar, tính bằng mili-giây.\n'
-                                   'Hai log thường dùng hai đồng hồ khác nhau nên phải canh thủ công.')
-        mode.addRow('Lệch đồng hồ IMU',self.imu_offset)
-        self.synced_logs=QCheckBox('Log đồng bộ (radar + IMU cùng đồng hồ)')
-        self.synced_logs.setToolTip('Bật khi log radar và log IMU đến từ cùng một bản ghi phần cứng\n'
-                                    '(capture_hardware.py): cả hai giữ nguyên đồng hồ gốc nên không\n'
-                                    'được dời riêng. Tắt khi dùng hai nguồn ghi độc lập.')
-        mode.addRow(self.synced_logs)
-        self.imu_label=QLabel('Chưa nạp log IMU');self.imu_label.setWordWrap(True);mode.addRow(self.imu_label)
-        self.button(mode,'Nhập CSV IMU 14 cột',self.import_imu)
-        self.button(mode,'Xuất CSV IMU từ mô hình phiên này',self.export_imu)
-        self.button(mode,'Bỏ log IMU',self.clear_imu)
-        self.speed=QComboBox();self.speed.addItems(['0.5×','1×','2×']);self.speed.setCurrentIndex(1);mode.addRow('Tốc độ thời gian',self.speed)
-        self.button(mode,'Bắt đầu / Reset phiên',self.start)
-        self.pause_button=self.button(mode,'Tạm dừng / Chạy tiếp',self.pause)
-        self.button(mode,'Dừng phiên',lambda:self.safe(lambda:self.session.command('SESSION_STOP','STOPPED')))
-        self.review_time=QSpinBox();self.review_time.setRange(0,100000000);self.review_time.setSingleStep(50);self.review_time.setSuffix(' ms')
-        mode.addRow('Mốc xem lại sau STOP',self.review_time)
-        self.button(mode,'Xem lại đồng bộ (không phát Serial)',lambda:self.safe(self.review_at,'Xem lại'))
-        self.status=QLabel('STOPPED');mode.addRow(self.status)
-        edit=self.group(controls,'3 · XE / QUỸ ĐẠO')
-        self.vehicle=QComboBox();self.vehicle.addItems(['EGO','ID31']);edit.addRow(self.vehicle)
-        self.x=self.number(edit,'Dọc X (m)',-10000,10000,0)
-        self.y=self.number(edit,'Ngang Y trái (m)',-100,100,0)
-        self.velocity=self.number(edit,'Tốc độ (km/h)',0,200,36)
-        self.heading=self.number(edit,'Hướng (độ)',-180,180,0)
-        self.duration=self.number(edit,'Thời gian chuyển làn (s)',2,12,4)
-        self.button(edit,'Đọc xe đang chọn',self.read_vehicle)
-        self.button(edit,'Áp dụng khi tạm dừng',self.edit_vehicle)
-        self.button(edit,'Chuyển làn trái +3.5 m',lambda:self.lane(3.5))
-        self.button(edit,'Chuyển làn phải −3.5 m',lambda:self.lane(-3.5))
-        self.button(edit,'Đi thẳng theo hướng đường',self.straight)
-        sensors=self.group(controls,'4 · THAM SỐ (PHIÊN MỚI)')
-        self.range=self.number(sensors,'Tầm mô phỏng (m)',5,100,40)
-        self.fov=self.number(sensors,'Nửa góc quét (độ)',5,75,60)
-        self.period=self.number(sensors,'Chu kỳ radar (ms)',40,500,65)
-        self.imu_period=self.number(sensors,'Chu kỳ IMU (ms)',10,100,10)
-        self.max_targets=self.number(sensors,'Giới hạn mục tiêu',1,4,4)
-        self.noise=self.number(sensors,'Nhiễu Y sigma (m)',0,1,0)
-        self.dropout=self.number(sensors,'Xác suất mất khung',0,1,0)
-        self.unassociated=self.number(sensors,'P(associated=0)',0,1,0)
-        self.yaw=self.number(sensors,'Ngưỡng yaw (độ/s)',.2,30,2)
-        self.confirm=self.number(sensors,'Xác nhận chuyển hướng (ms)',50,2000,200)
-        self.near=self.number(sensors,'Vùng gần (m)',1,100,18)
-        controls.addStretch()
-        panels.addWidget(QLabel('DỮ LIỆU ĐANG GỬI · IMU theo chu kỳ đã chọn / radar riêng'))
-        self.sent=QPlainTextEdit();self.sent.setReadOnly(True);panels.addWidget(self.sent,1)
+        right_scroll=QScrollArea();right_scroll.setWidgetResizable(True);right_scroll.setWidget(right);right_scroll.setMinimumWidth(230);split.addWidget(right_scroll)
+        split.setSizes([350,740,250])
+        build_pages(self,self.control_stack)
+        self.tabs.setCurrentIndex(1)
+        input_title=QLabel('DỮ LIỆU ĐANG GỬI · IMU / radar theo nguồn đã chọn')
+        input_title.setWordWrap(True);panels.addWidget(input_title)
+        self.sent=QPlainTextEdit();self.sent.setReadOnly(True);self.sent.setMinimumHeight(60);panels.addWidget(self.sent,1)
         self.imu_values=QLabel('IMU: chưa có mẫu');self.imu_values.setWordWrap(True);panels.addWidget(self.imu_values)
         self.imu_plot=ImuPlot();panels.addWidget(self.imu_plot)
         self.output_title=QLabel('KẾT QUẢ THỰC TỪ ESP32');panels.addWidget(self.output_title)
         self.reason=QLabel('Chưa có phản hồi ESP32\n? Mất/thiếu dữ liệu');self.reason.setWordWrap(True);panels.addWidget(self.reason)
         self.ai_reason=QLabel('AI: chưa bật');self.ai_reason.setWordWrap(True);panels.addWidget(self.ai_reason)
         self.comparison_label=QLabel('Chưa đủ kết quả để đối chiếu');self.comparison_label.setWordWrap(True);panels.addWidget(self.comparison_label)
-        self.received=QPlainTextEdit();self.received.setReadOnly(True);panels.addWidget(self.received,1)
+        self.received=QPlainTextEdit();self.received.setReadOnly(True);self.received.setMinimumHeight(60);panels.addWidget(self.received,1)
         self.timeline_area=QGroupBox('SO SÁNH THEO THỜI GIAN CẢM BIẾN');timeline_layout=QVBoxLayout(self.timeline_area)
-        timeline_layout.addWidget(QLabel('Xám: NONE · Vàng: MONITOR · Đỏ: HIGH · Tím: thiếu/UNKNOWN/không nhãn · Hồng: bất đồng (không phải sai với nhãn)'))
-        self.timeline=ComparisonTimeline();timeline_layout.addWidget(self.timeline)
+        self.timeline_area.setStyleSheet('QGroupBox {padding:4px;margin-top:10px;}');timeline_layout.setContentsMargins(8,12,8,6);timeline_layout.setSpacing(3)
+        legend=QLabel('Xám: NONE · Vàng: MONITOR · Đỏ: HIGH · Tím: thiếu/UNKNOWN/không nhãn · Hồng: bất đồng ≠ sai với nhãn. Xem lại: Dừng phiên và chờ ACK.');legend.setWordWrap(True);timeline_layout.addWidget(legend)
+        self.timeline=ComparisonTimeline();self.timeline.setStyleSheet('font-size:11px;');timeline_layout.addWidget(self.timeline)
         self.timeline.selected.connect(self.jump_timeline)
         navigation=QHBoxLayout();timeline_layout.addLayout(navigation)
         self.difference_select=QComboBox();navigation.addWidget(self.difference_select,1)
@@ -160,18 +104,141 @@ class Window(QMainWindow):
         self.difference_prev.clicked.connect(lambda:self.step_difference(-1))
         self.difference_next.clicked.connect(lambda:self.step_difference(1))
         self.difference_jump.clicked.connect(self.jump_difference)
-        self.timeline_summary=QPlainTextEdit();self.timeline_summary.setReadOnly(True);self.timeline_summary.setMaximumHeight(95)
+        self.timeline_summary=QPlainTextEdit();self.timeline_summary.setReadOnly(True);self.timeline_summary.setFixedHeight(40)
         timeline_layout.addWidget(self.timeline_summary)
-        outer.addWidget(self.timeline_area);self.timeline_area.hide()
+        review=QHBoxLayout();timeline_layout.addLayout(review)
+        self.review_time=QSpinBox();self.review_time.setRange(0,100000000);self.review_time.setSingleStep(50);self.review_time.setSuffix(' ms')
+        review.addWidget(QLabel('Mốc xem lại sau STOP'));review.addWidget(self.review_time)
+        self.review_button=QPushButton('Xem lại đồng bộ (không phát Serial)');self.review_button.clicked.connect(lambda:self.safe(self.review_at,'Xem lại'));review.addWidget(self.review_button)
+        outer.addWidget(self.timeline_area)
         log_buttons=QHBoxLayout();outer.addLayout(log_buttons)
         toggle=QPushButton('Hiện / ẩn log');toggle.clicked.connect(lambda:self.logs.setVisible(not self.logs.isVisible()));log_buttons.addWidget(toggle)
         export=QPushButton('Xuất log TX/RX + cấu hình');export.clicked.connect(self.export_log);log_buttons.addWidget(export)
+        help_button=QPushButton('Giải thích từng trường');help_button.clicked.connect(lambda:open_field_guide(self));log_buttons.addWidget(help_button)
         self.logs=QPlainTextEdit();self.logs.setReadOnly(True);self.logs.setMaximumHeight(140);self.logs.hide();outer.addWidget(self.logs)
         self.timer=QTimer();self.timer.timeout.connect(self.tick);self.timer.start(16)
         self.panel_timer=QTimer();self.panel_timer.timeout.connect(self.refresh_panels);self.panel_timer.start(150)
-        for combo in left.findChildren(QComboBox):
-            combo.setMinimumContentsLength(10)
-            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        install_wheel_guard(self)
+        if (self.repo/self.ml_config['artifacts']/'trusted-model.json').exists():self.compare.setChecked(True)
+        self.refresh_panels()
+
+    def change_rule_source(self,index):
+        if self.session.state not in ('STOPPED','ERROR') or self.session.pending:
+            self.rule_source.blockSignals(True);self.rule_source.setCurrentIndex(0 if self.session.rule_source=='pc' else 1);self.rule_source.blockSignals(False);return
+        if self.session.link:self.session.disconnect()
+        self.session.rule_source='pc' if index==0 else 'esp32'
+        self.session.applied_rules={}
+        self.session.result=None;self.session.pc_rules=None;self.reset_comparison_view()
+        self.capabilities_asked=False
+        if index==1:self.scan_ports()
+        self.refresh_panels()
+
+    def sync_steer_widgets(self):
+        ego=self.session.world.ego
+        value=round(ego.steer*100) if ego.control=='manual' else 0
+        self.steer_slider.blockSignals(True);self.steer_slider.setValue(value);self.steer_slider.blockSignals(False)
+
+    def set_steer_sensitivity(self,value):
+        self.session.steer_sensitivity=value
+        self.session.world.ego.steer_sensitivity=value
+        self.session.record('META',dict(type='STEER_SENSITIVITY',t_ms=round(self.session.world.t*1000),value=value))
+
+    def set_steer(self,value,from_slider=False):
+        """Live EGO steering from slider, hold-buttons or arrow keys."""
+        reason=self.session.steer_reason()
+        if reason:
+            self.sync_steer_widgets();self.steer_hint.setText('Tay lái bị khóa: '+reason)
+            return
+        try:self.session.steer(value)
+        except ValueError as error:
+            self.steer_hint.setText(str(error))
+        self.sync_steer_widgets();self.refresh_controls()
+        self.road.update();self.ai_road.update()
+
+    def release_steering(self):
+        try:self.session.release_ego()
+        except ValueError as error:
+            self.steer_hint.setText('Tay lái bị khóa: '+str(error));return
+        self.sync_steer_widgets();self.refresh_controls()
+
+    def set_imu_mode(self,index):
+        self.session.imu_mode='manual' if index else 'auto'
+        if not index:self.gyro_value.setValue(0)
+        self.session.record('META',dict(type='IMU_MODE',imu_mode=self.session.imu_mode,t_ms=round(self.session.world.t*1000)))
+        self.refresh_controls()
+
+    def set_manual_gyro(self,value):
+        self.gyro_slider.blockSignals(True);self.gyro_slider.setValue(round(value*10));self.gyro_slider.blockSignals(False)
+        self.session.manual_gz=value
+        self.gyro_direction.setText(f'{value:+.1f} °/s · '+('trái (+)' if value>0 else 'phải (−)' if value<0 else 'không quay'))
+        self.session.record('META',dict(type='MANUAL_IMU_CHANGE',imu_mode=self.session.imu_mode,gz_dps=value,
+            t_ms=round(self.session.world.t*1000),applies='next scheduled synthetic IMU; no extra sample'))
+
+    def show_source_options(self):
+        for index,group in enumerate(self.source_groups):
+            group.setVisible(index==self.source_choice.currentIndex())
+        self.refresh_controls()
+
+    def refresh_controls(self):
+        if not hasattr(self,'review_button') or not hasattr(self,'loaded_scenario'):return
+        stopped=self.session.state in ('STOPPED','ERROR') and not self.session.pending
+        synthetic=not self.session.dataset and not self.session.replay and not self.session.imu_recording
+        edit_reason=self.session.vehicle_edit_reason()
+        editable=not edit_reason
+        moving=not self.session.vehicle_edit_reason(paused=False)
+        loaded=('Dataset '+self.session.dataset.meta['session_id'] if self.session.dataset else
+                ('CSV/log radar'+(' + IMU' if self.session.imu_recording else '') if self.session.replay else
+                 'CSV IMU + radar tổng hợp' if self.session.imu_recording else 'Kịch bản: '+scenarios.NAMES[self.loaded_scenario]))
+        self.source_label.setText('Đang chọn ≠ đã nạp. Xem Nguồn phía trên; nạp lỗi giữ nguồn cũ.')
+        self.session_summary.setText(self.rule_title()+' | '+self.session.state+' | Nguồn: '+loaded)
+        applied=self.session.applied_rules
+        if applied:
+            yellow=str(applied['yellow_m'])+' m' if applied.get('yellow_mode')=='distance' else 'phát hiện'
+            confirmation='chờ ACK' if self.session.rule_source=='esp32' and self.session.applied_firmware is None else 'đã áp dụng'
+            self.session_summary.setText(self.session_summary.text()+f" | Luật {confirmation}: vàng {yellow}, đỏ {applied['near_m']} m | IMU {self.session.imu_mode}")
+        self.connection_shortcut.setVisible(self.session.rule_source=='esp32' and self.session.link is None)
+        self.rule_source.setEnabled(stopped)
+        self.rule_source_note.setText('PC không mở COM / không chờ ACK; không phải bằng chứng phần cứng.' if self.session.rule_source=='pc' else
+            'Firmware: '+self.session.capabilities.get('rule_version','chưa xác nhận')+' · vàng riêng: '+('có khai báo hỗ trợ; cần START ACK đúng cấu hình' if self.session.capabilities.get('yellow_distance_v1') else 'chưa xác nhận, dùng vàng kiểu cũ hoặc chuyển PC'))
+        self.open_log_button.setEnabled(stopped)
+        self.connect_button.setEnabled(self.session.rule_source=='esp32')
+        for widget in (self.port,self.baud,self.scan_button):widget.setEnabled(self.session.rule_source=='esp32' and self.session.link is None)
+        self.imu_mode.setEnabled(synthetic and not self.session.pending)
+        for widget in (self.gyro_slider,self.gyro_value,self.gyro_zero,self.gyro_auto):widget.setEnabled(synthetic and not self.session.pending and self.imu_mode.currentIndex()==1)
+        prefix=('PC đang áp dụng: ' if self.session.rule_source=='pc' else 'Bo đã ACK cấu hình: ' if self.session.applied_firmware is not None else 'Đã yêu cầu, chưa ACK: ')
+        self.applied_label.setText(prefix+json.dumps(self.session.applied_firmware or applied,ensure_ascii=False) if applied else 'Chưa có phiên: các ô là cấu hình chuẩn bị.')
+        for widget in (self.synthetic_button,self.dataset_button,self.radar_button,self.imu_button,
+                       self.dataset_collection,
+                       self.clear_imu_button,self.compare,self.ai_variant,self.speed,self.synthetic_imu,
+                       self.import_radar,self.imu_profile,self.imu_mount,self.mount_roll,self.mount_pitch,
+                       self.mount_yaw,self.imu_offset,self.synced_logs):widget.setEnabled(stopped)
+        self.start_button.setEnabled(not self.session.pending)
+        self.setup_panel.refresh()
+        self.steer_sensitivity.setEnabled(not (self.session.dataset or self.session.replay or self.session.imu_recording or self.session.pending))
+        self.pause_button.setEnabled(self.session.state in ('RUNNING','PAUSED') and not self.session.pending)
+        self.pause_button.setText('Chạy tiếp' if self.session.state=='PAUSED' else 'Tạm dừng')
+        self.stop_button.setEnabled(self.session.state in ('RUNNING','PAUSED') and not self.session.pending)
+        for widget in (self.x,self.y,self.velocity,self.heading,self.apply_vehicle_button):widget.setEnabled(editable)
+        for widget in (self.duration,self.lane_left,self.lane_right):widget.setEnabled(moving)
+        self.straight_button.setEnabled(editable)
+        steer_reason=self.session.steer_reason()
+        for widget in (self.steer_slider,self.steer_left_button,self.steer_right_button,self.steer_center_button):
+            widget.setEnabled(not steer_reason)
+        self.steer_release_button.setEnabled(not steer_reason and self.session.world.ego.control=='manual')
+        ego=self.session.world.ego
+        self.steer_hint.setText(('Tay lái bị khóa: '+steer_reason) if steer_reason else
+            ('EGO đang do bạn lái; kịch bản không giành lại.' if ego.control=='manual' else 'EGO đang theo kịch bản; bẻ lái bất kỳ lúc nào để tiếp quản.'))
+        self.control_status.setText(self.session.driver_text()+(f' | Tình huống: {scenarios.NAMES[self.session.scenario]}' if not (self.session.dataset or self.session.replay or self.session.imu_recording) and self.session.state!='STOPPED' else
+            (f' | Tình huống đã nạp: {scenarios.NAMES[self.loaded_scenario]}' if not (self.session.dataset or self.session.replay or self.session.imu_recording) else '')))
+        self.edit_hint.setText(edit_reason or 'PAUSED: chỉ trường đã sửa được áp dụng; tốc độ giữ đường chạy, kéo xe thay đường chạy của đúng xe.')
+        self.lane_hint.setText(self.session.vehicle_edit_reason(paused=False) or 'Quỹ đạo tay thay lệnh hẹn giờ cho đúng xe; xe chưa chỉnh vẫn theo kịch bản.')
+        review=self.session.state=='STOPPED' and not self.session.pending and bool(self.visual_history) and self.ai is not None
+        self.review_button.setEnabled(review);self.review_time.setEnabled(review)
+        self.difference_select.setEnabled(review)
+        for button in (self.difference_prev,self.difference_next,self.difference_jump):
+            button.setEnabled(review and self.difference_select.count()>0)
+        self.timeline.enabled_review=review
+        self.export_imu_button.setEnabled(bool(self.session.live_imu_rows) and not self.session.live_imu_overflow)
 
     def group(self,layout,title):
         group=QGroupBox(title);form=QFormLayout(group);form.setRowWrapPolicy(QFormLayout.WrapLongRows);layout.addWidget(group);return form
@@ -185,9 +252,11 @@ class Window(QMainWindow):
     def safe(self,action,operation='Thao tác'):
         try:
             action()
+            self.refresh_controls()
             return True
         except Exception as error:
             self.report_error(error,operation)
+            self.refresh_controls()
             return False
 
     def report_error(self,error,operation):
@@ -215,19 +284,21 @@ class Window(QMainWindow):
         box.exec()
 
     def scan_ports(self):
+        if self.session.rule_source=='pc':return
         self.port.clear()
         for device,description in ports():
             self.port.addItem(f'{device} · {description}',device)
 
     def connect_port(self):
         def action():
+            if self.session.rule_source=='pc':raise ValueError('Chọn ESP32 thật trước khi mở COM')
             if self.session.link:
                 self.session.disconnect()
             else:
                 if not self.port.currentData():
                     raise ValueError('Không có cổng Serial; vẫn có thể xem mô phỏng offline.')
                 self.session.link=SerialLink(self.port.currentData(),int(self.baud.currentText()))
-                self.session.state='STOPPED';self.session.result=None
+                self.session.state='STOPPED';self.session.result=None;self.capabilities_asked=False
         self.safe(action)
         self.refresh_panels()
 
@@ -238,9 +309,12 @@ class Window(QMainWindow):
 
     def start(self):
         def action():
+            if not (self.session.dataset or self.session.replay or self.session.imu_recording) and self.setup_panel.dirty():
+                raise ValueError('Còn thay đổi chưa lưu. Bấm Lưu cấu hình đầu phiên trước khi Bắt đầu / Chạy lại.')
             if self.compare.isChecked():
-                if not (self.repo/self.ml_config['artifacts']/'trusted-model.json').exists():
-                    raise ValueError('MODEL_MISSING: chạy ai/sensor_lab.py train trước; không dùng NONE thay model thiếu')
+                selected_config=json.loads((self.repo/self.ai_variant.currentData()).read_text())
+                if not (self.repo/selected_config['artifacts']/'trusted-model.json').exists():
+                    raise ValueError('MODEL_MISSING: chưa có artifact của Cấu hình AI đang chọn; xem hướng dẫn train đúng phiên bản.')
                 if self.ai:self.ai.close();self.ai=None
             cfg=self.session.radar.config
             cfg.range_m=self.range.value();cfg.half_fov_deg=self.fov.value()
@@ -252,7 +326,9 @@ class Window(QMainWindow):
             if not self.session.imu_recording and self.session.link and budget_bytes_per_second(cfg.period_ms,cfg.max_targets,speed,
                                                                self.session.imu_period_ms)>int(self.baud.currentText())/10*.8:
                 raise ValueError('Vượt ngân sách Serial 80%. Chọn 921600, giảm tốc độ, tăng chu kỳ IMU/radar hoặc giảm số mục tiêu.')
-            self.session.rules.update(yaw_threshold_dps=self.yaw.value(),confirm_ms=int(self.confirm.value()),near_m=self.near.value())
+            self.session.rules.update(yaw_threshold_dps=self.yaw.value(),confirm_ms=int(self.confirm.value()),near_m=self.near.value(),
+                yellow_mode='distance' if self.yellow_mode.currentIndex() else 'detected',yellow_m=self.yellow.value())
+            if self.session.rule_source=='esp32' and not self.session.link:raise ValueError('ESP32 thật chưa kết nối; không tự chuyển sang PC')
             self.session.replay_imu=self.synthetic_imu.isChecked()
             if self.session.imu_recording:
                 if self.session.imu_recording.profile!=self.imu_profile.currentText():
@@ -264,7 +340,9 @@ class Window(QMainWindow):
                 self.session.imu_offset_ms=self.imu_offset.value()
             if self.session.link and not self.session.wait_link_ready(8):
                 raise ValueError('Serial chưa sẵn sàng. Đóng mọi Serial Monitor, rồi thử lại.')
-            self.session.start(self.scenario.currentIndex())
+            self.session.start(self.loaded_scenario)
+            self.sync_steer_widgets()
+            self.gyro_value.setValue(0);self.session.manual_gz=0.;self.set_manual_gyro(0)
             self.rule_history=[];self.compare_seen=set();self.review_pair=None;self.visual_history=[];self.visual_tick=-1
             self.timeline_signature=None;self.timeline_rows=[];self.timeline.set_rows([])
             self.reference_labels={}
@@ -274,7 +352,7 @@ class Window(QMainWindow):
                 self.reference_labels=label_map(self.session.dataset.folder)
             if self.compare.isChecked():
                 from .ml.bridge import Bridge
-                self.ai=Bridge(self.repo,self.session.envelope.session)
+                self.ai=Bridge(self.repo,self.session.envelope.session,self.ai_variant.currentData())
                 self.session.sensor_observer=self.observe_sensors
                 self.session.result_observer=self.observe_rule
                 self.common_hash=__import__('hashlib').sha256();self.common_count=0
@@ -283,16 +361,22 @@ class Window(QMainWindow):
             self.vehicle.clear();self.vehicle.addItems(['EGO',*[f'ID{c.track_id}' for c in self.session.world.targets]])
             self.accumulator=0
         self.safe(action,operation='Bắt đầu phiên')
+        self.refresh_controls()
 
     def toggle_comparison(self,enabled):
         if self.session.state not in ('STOPPED','ERROR') or self.session.pending:
             self.compare.blockSignals(True);self.compare.setChecked(not enabled);self.compare.blockSignals(False)
             return
-        self.ai_road.setVisible(enabled)
-        self.timeline_area.setVisible(enabled)
-        if enabled:self.resize(1880,980)
-        self.road.caption='Bộ luật · ESP32' if enabled else 'GÓC NHÌN TỪ TRÊN • CAMERA BÁM XE'
+        # Both views and timeline stay mounted; comparison only enables inference.
         if not enabled and self.ai:self.ai.close();self.ai=None
+
+    def select_dataset_collection(self):
+        # Browsing a manifest is not loading it into the active Session.
+        self.dataset_root=self.repo/self.dataset_collection.currentData()
+        self.dataset_session.clear();path=self.dataset_root/'sessions.json'
+        if path.exists():
+            for row in json.loads(path.read_text()):
+                self.dataset_session.addItem(f"{row['session_id']} · {row['split']} · {row['scenario']}",row['session_id'])
 
     def load_dataset(self):
         if self.session.state not in ('STOPPED','ERROR') or self.session.pending:
@@ -307,9 +391,11 @@ class Window(QMainWindow):
         self.speed.setCurrentIndex(0);self.synced_logs.setChecked(True)
         self.session.radar.config.max_targets=3;self.max_targets.setValue(3)
         self.session.events.append(f"Dataset {replay.meta['session_id']}: {len(replay.events)} sensor events; {replay.empty} OK/0; {replay.dropped} DROPPED không phát; Oracle chỉ dùng vẽ")
-        self.imu_label.setText('Dataset: 4800 mẫu IMU 200 Hz; timestamp chung; phát 0.5× không bỏ mẫu')
+        self.imu_label.setText(f'Dataset: {len(replay.imu_points)} mẫu IMU; timestamp chung; phát 0.5× không bỏ mẫu')
 
     def reset_comparison_view(self):
+        self.session.historical_no_geometry=False
+        self.session.reviewing_history=False
         if self.ai:self.ai.close();self.ai=None
         self.session.sensor_observer=None;self.session.result_observer=None
         self.rule_history=[];self.review_pair=None;self.visual_history=[];self.visual_tick=-1
@@ -338,6 +424,10 @@ class Window(QMainWindow):
         if self.review_pair is not None:return self.review_pair[1]
         return self.ai.visible(round(self.session.world.t*1000),self.session.state) if self.ai else None
 
+    def rule_title(self):
+        source=(self.review_pair[0].get('rule_source','esp32') if self.review_pair and self.review_pair[0] else self.session.rule_source)
+        return 'Bộ luật · Máy tính' if source=='pc' else 'Bộ luật · ESP32 thật'
+
     def visible_rule(self):
         if self.review_pair is not None:return self.review_pair[0]
         return self.session.visible_result()
@@ -346,6 +436,7 @@ class Window(QMainWindow):
         if self.session.state!='STOPPED' or self.session.pending:
             raise ValueError('Chỉ xem lại sau STOP và ACK; không chạy lại inference hoặc gửi dữ liệu')
         if not self.visual_history or not self.ai:raise ValueError('Chưa có lượt chạy so sánh để xem lại')
+        self.session.reviewing_history=True
         import copy
         stamp,world,sent=min(self.visual_history,key=lambda row:abs(row[0]-self.review_time.value()))
         def nearest(rows):
@@ -359,6 +450,34 @@ class Window(QMainWindow):
     def jump_timeline(self,stamp):
         if self.session.state!='STOPPED' or self.session.pending:return
         self.review_time.setValue(stamp);self.safe(self.review_at,'Xem lại timeline')
+
+    def open_comparison_log(self):
+        if self.session.state not in ('STOPPED','ERROR') or self.session.pending:
+            raise ValueError('Dừng phiên/chờ ACK trước khi mở log')
+        path,_=QFileDialog.getOpenFileName(self,'Mở log so sánh đã ghi',str(self.session.log_dir),'JSON Lines (*.jsonl)')
+        if not path:return
+        from .ml.comparison import read_log
+        rules,ai,sid=read_log(path)
+        if not rules or not ai:raise ValueError('Log cần kết quả bộ luật và AI cùng một phiên')
+        sources={r.get('rule_source','esp32') for r in rules}
+        if len(sources)!=1:raise ValueError('Không trộn nguồn PC/ESP32 trong một lịch sử')
+        from types import SimpleNamespace
+        import copy
+        self.reset_comparison_view()
+        self.session.disconnect()
+        if self.session.log:self.session.log.close();self.session.log=None
+        self.session.state='STOPPED';self.session.envelope.session=sid
+        self.session.rule_source=next(iter(sources))
+        self.rule_source.blockSignals(True);self.rule_source.setCurrentIndex(0 if self.session.rule_source=='pc' else 1);self.rule_source.blockSignals(False)
+        self.session.pc_rules=None;self.session.applied_rules=rules[-1].get('applied_rules',{})
+        self.ai=SimpleNamespace(history=ai,latest_wall=0,error=None,close=lambda:None,visible=lambda *args:None,poll=lambda *args:None)
+        self.rule_history=rules;self.reference_labels={}
+        world=copy.deepcopy(self.session.world);world.targets=[]
+        for stamp in sorted({r['t_ms'] for r in rules}):
+            world.t=stamp/1000;self.visual_history.append((stamp,copy.deepcopy(world),{}))
+        self.compare.blockSignals(True);self.compare.setChecked(True);self.compare.blockSignals(False)
+        self.session.historical_no_geometry=True
+        self.review_time.setValue(rules[0]['t_ms']);self.review_at()
 
     def jump_difference(self):
         stamp=self.difference_select.currentData()
@@ -395,14 +514,14 @@ class Window(QMainWindow):
             for side,values in sides.items():
                 first=f"{values['first_high_observation_ms']/1000:.3f}s (lưới {values['first_high_ms']/1000:.2f}s)" if values['first_high_ms'] is not None else 'chưa quan sát'
                 parts.append(f"{side}: HIGH đầu {first}; tổng {values['high_ms']/1000:.2f}s; thiếu {values['unknown_ms']/1000:.2f}s")
-            lines.append(source.upper()+' · '+' | '.join(parts))
+            lines.append((self.rule_title() if source=='esp32' else 'AI')+' · '+' | '.join(parts))
         scoring=summary['scoring']
         if scoring['labelled_after_warmup_cells']:
-            lines.append(f"Nhãn: {scoring['common_valid_cells']}/{scoring['labelled_after_warmup_cells']} mốc×bên chung hợp lệ (sau warm-up; không chấm đuôi thiếu nhãn); HIGH thiếu kết quả: ESP32 {scoring['high_uncovered_labelled']['esp32']}, AI {scoring['high_uncovered_labelled']['ai']}")
+            lines.append(f"Nhãn: {scoring['common_valid_cells']}/{scoring['labelled_after_warmup_cells']} mốc×bên chung hợp lệ (sau warm-up; không chấm đuôi thiếu nhãn); HIGH thiếu kết quả: Bộ luật {scoring['high_uncovered_labelled']['esp32']}, AI {scoring['high_uncovered_labelled']['ai']}")
             if scoring['common_valid_cells']:
                 parts=[]
                 for source,m in scoring['predictors'].items():
-                    parts.append(f"{source}: bỏ sót HIGH {m['high_missed_cells']} mốc; báo HIGH nhầm {m['high_false_cells']} mốc; macro-F1 {m['macro_f1']:.3f}")
+                    parts.append(f"{self.rule_title() if source=='esp32' else source}: bỏ sót HIGH {m['high_missed_cells']} mốc; báo HIGH nhầm {m['high_false_cells']} mốc; macro-F1 {m['macro_f1']:.3f}")
                 lines.append(' | '.join(parts))
             else:lines.append('Chưa có mốc chung hợp lệ để chấm; không suy ra accuracy từ mức đồng ý.')
         else:lines.append('Chưa có nhãn để chấm; mức đồng ý không phải độ chính xác.')
@@ -415,7 +534,7 @@ class Window(QMainWindow):
     def import_recording(self):
         if self.session.state not in ('STOPPED','ERROR') or self.session.pending:
             QMessageBox.information(self,'Nguồn dữ liệu','Dừng phiên và chờ ACK trước khi đổi nguồn.');return
-        path,_=QFileDialog.getOpenFileName(self,'Radar CSV / D,E logger',str(Path(__file__).parent.parent/'samples'),'Radar (*.csv *.txt *.log);;All (*)')
+        path,_=QFileDialog.getOpenFileName(self,'Radar CSV / D,E logger',str(self.repo/'tools/samples'),'Radar (*.csv *.txt *.log);;All (*)')
         if path:
             rebase=not self.synced_logs.isChecked()
             def action():
@@ -429,18 +548,23 @@ class Window(QMainWindow):
             self.safe(action)
 
     def synthetic(self):
-        if self.session.state!='STOPPED' or self.session.pending:
+        if self.session.state not in ('STOPPED','ERROR') or self.session.pending:
             QMessageBox.information(self,'Nguồn dữ liệu','Dừng phiên trước khi đổi nguồn.');return
         self.session.dataset=None;self.session.replay=None;self.session.clear_imu();self.session.last_sent={};self.session.result=None
+        # No residue of a previous replay may reach the synthetic loop.
+        self.session.replay_index=0;self.session.replay_finished=False;self.session.replay_imu=False
         self.reset_comparison_view()
         self.imu_label.setText('Chưa nạp log IMU')
+        self.loaded_scenario=self.scenario.currentIndex()
+        self.setup_panel.load(self.loaded_scenario)
+        self.refresh_controls()
 
     def import_imu(self):
         """Import a BMI160 IMU log (timestamp_us, accel g, gyro dps)."""
         if self.session.state not in ('STOPPED','ERROR') or self.session.pending:
             QMessageBox.information(self,'Nguồn dữ liệu','Dừng phiên và chờ ACK trước khi đổi nguồn.');return
         path,_=QFileDialog.getOpenFileName(self,'CSV IMU — 14 cột / physical_only legacy',
-                                          str(Path(__file__).parent.parent/'samples'),
+                                          str(self.repo/'tools/samples'),
                                           'IMU CSV (*.csv *.txt *.log);;All (*)')
         if not path:
             return
@@ -476,30 +600,65 @@ class Window(QMainWindow):
         cars=[self.session.world.ego,*self.session.world.targets]
         return cars[min(max(0,self.vehicle.currentIndex()),len(cars)-1)]
 
+    def vehicle_field_changed(self,key):
+        if not self.vehicle_form_loading:self.vehicle_dirty.add(key)
+
+    def select_vehicle(self,track_id):
+        index=self.vehicle.findText('EGO' if track_id==0 else f'ID{track_id}')
+        if index>=0:self.vehicle.setCurrentIndex(index)
+        self.read_vehicle()
+
+    def vehicle_dragged(self,track_id):
+        self.select_vehicle(track_id)
+        car=self.chosen()
+        self.vehicle_feedback.setText(f'Đã kéo: {self.vehicle.currentText()} · X={car.x:.2f} m, Y={car.y:.2f} m · giữ tốc độ/hướng')
+        self.record_vehicle_edit(car,'drag')
+
+    def record_vehicle_edit(self,car,operation):
+        self.session.record('META',dict(type='MANUAL_VEHICLE_EDIT',operation=operation,
+            t_ms=round(self.session.world.t*1000),track_id=car.track_id,x=car.x,y=car.y,
+            speed_mps=car.speed,heading_rad=car.heading,manual_fields=sorted(car.manual_fields)))
+        self.road.update();self.ai_road.update()
+
     def read_vehicle(self):
-        car=self.chosen();self.road.selected=car.track_id
-        self.x.setValue(car.x);self.y.setValue(car.y);self.velocity.setValue(car.speed*3.6);self.heading.setValue(math.degrees(car.heading))
+        car=self.chosen();self.road.selected=self.ai_road.selected=car.track_id
+        self.vehicle_form_loading=True
+        try:
+            self.x.setValue(car.x);self.y.setValue(car.y);self.velocity.setValue(car.speed*3.6);self.heading.setValue(math.degrees(car.heading))
+        finally:self.vehicle_form_loading=False
+        self.vehicle_form_id=car.track_id;self.vehicle_dirty.clear()
+        self.road.update();self.ai_road.update()
 
     def edit_vehicle(self):
-        if self.session.dataset:return
-        if self.session.state!='PAUSED' or self.session.pending or self.session.replay:
-            QMessageBox.information(self,'Chỉnh xe','Chỉ chỉnh vị trí trong mô phỏng tổng hợp khi đã tạm dừng.');return
-        car=self.chosen();car.x=self.x.value();car.y=self.y.value();car.speed=self.velocity.value()/3.6
-        car.heading=math.radians(self.heading.value());car.lane=None;car.settle()
+        reason=self.session.vehicle_edit_reason()
+        if reason:self.vehicle_feedback.setText(reason);return
+        car=self.chosen()
+        if self.vehicle_form_id!=car.track_id:
+            self.read_vehicle();self.vehicle_feedback.setText('Đã đọc xe hiện tại; sửa trường cần đổi rồi Áp dụng.');return
+        for widget in (self.x,self.y,self.velocity,self.heading):widget.interpretText()
+        values=dict(x=self.x.value(),y=self.y.value(),speed=self.velocity.value()/3.6,heading=math.radians(self.heading.value()))
+        changes={key:values[key] for key in self.vehicle_dirty}
+        car.apply_manual(**changes)
+        if not all(math.isclose(getattr(car,k),v,abs_tol=1e-9) for k,v in changes.items()):
+            self.vehicle_feedback.setText('Chưa xác nhận được thay đổi; hãy Đọc xe đang chọn.');return
+        self.read_vehicle();self.record_vehicle_edit(car,'apply')
+        self.vehicle_feedback.setText(f'Đã áp dụng: {self.vehicle.currentText()} · {car.speed*3.6:g} km/h')
+        if 'speed' in changes:
+            self.profile_feedback.setText(f'{self.vehicle.currentText()}: lịch gia tốc dừng đến hết phiên; cấu hình đầu phiên giữ nguyên.')
 
     def lane(self,delta):
-        if self.session.dataset:return
-        if self.session.replay and not self.session.replay_imu:
-            return
-        self.chosen().change_lane(delta,self.duration.value())
+        if self.session.vehicle_edit_reason(paused=False):return
+        self.chosen().change_lane(delta,self.duration.value(),manual=True)
+        self.record_vehicle_edit(self.chosen(),'lane')
 
     def straight(self):
-        if self.session.dataset:return
-        if self.session.state=='PAUSED' and not self.session.pending:
-            car=self.chosen();car.lane=None;car.heading=0;car.settle()
+        if self.session.vehicle_edit_reason():return
+        self.chosen().go_straight();self.read_vehicle();self.record_vehicle_edit(self.chosen(),'straight')
 
     def tick(self):
         now=time.monotonic();elapsed=now-self.last_tick;self.last_tick=now
+        if self.session.rule_source=='esp32' and self.link_ready() and not self.capabilities_asked:
+            self.session.send('GET_CAPABILITIES');self.capabilities_asked=True
         self.session.poll()
         if self.ai:
             self.ai.poll(self.session.record)
@@ -526,13 +685,19 @@ class Window(QMainWindow):
         self.ai_road.update()
 
     def refresh_panels(self):
+        title=self.rule_title();self.road.caption=title
+        self.timeline.rule_caption='Luật PC' if title.endswith('Máy tính') else 'ESP32 thật'
+        self.timeline_area.setTitle('SO SÁNH THEO THỜI GIAN CẢM BIẾN · '+title)
+        self.output_title.setText('KẾT QUẢ · '+title);self.timeline.update()
         connected=self.session.link is not None
         ready=self.link_ready()
         self.connect_button.setText('Ngắt kết nối' if connected else 'Kết nối')
-        if connected and not ready:
+        if self.session.rule_source=='pc':
+            self.connection_label.setText('Bộ luật PC · không mở COM / không chờ ACK')
+        elif connected and not ready:
             self.connection_label.setText('Đang chờ board khởi động xong (dọn nhiễu boot ROM)…')
         elif connected:
-            self.connection_label.setText('Serial đang mở · chờ/kết quả theo phiên')
+            self.connection_label.setText('COM đã mở; '+('SESSION_START đã ACK' if self.session.state in ('RUNNING','PAUSED') and not (self.session.pending and self.session.pending[0]=='SESSION_START') else 'chưa xác nhận SESSION_START của phiên hoạt động'))
         else:
             self.connection_label.setText('Chỉ mô phỏng · chưa kết nối')
         self.status.setText(self.session.state+(' · chờ ACK' if self.session.pending else ''))
@@ -577,15 +742,15 @@ class Window(QMainWindow):
             self.imu_plot.set_points([(r[0]/1e6,*(float(v)*9.80665 for v in r[7:10]),*(float(v) for v in r[10:13])) for r in rows])
         self.sent.setPlainText(json.dumps(self.session.last_sent,ensure_ascii=False,indent=2))
         result=self.visible_rule()
-        self.received.setPlainText(json.dumps(result,indent=2) if result else 'Chưa có phản hồi ESP32 hợp lệ / mới trong 1 giây.')
+        self.received.setPlainText(json.dumps(result,indent=2) if result else 'Chưa có kết quả hợp lệ / mới trong 1 giây · '+title)
         if result:
-            lines=[f"ESP32: xử lý t={result['t_ms']} ms · tuổi nhận trên PC={1000*(time.monotonic()-self.session.result_wall):.0f} ms"]
+            lines=[f"{title}: xử lý t={result['t_ms']} ms · tuổi nhận trên PC={1000*(time.monotonic()-self.session.result_wall):.0f} ms"]
             for side,title in [('left','Trái'),('right','Phải')]:
                 state=result[side];lines.append(f"{title}: {state['level']} · {state.get('reason_code','')}\nradar={state.get('radar_id')} / track={state.get('track_id')}")
             self.reason.setText('\n'.join(lines))
         else:
             stale=self.session.link is not None and self.session.result is not None and time.monotonic()-self.session.result_wall>1
-            self.reason.setText('? Mất/thiếu dữ liệu\n'+('Phản hồi ESP32 quá hạn (>1000 ms)' if stale else 'Chưa có phản hồi ESP32'))
+            self.reason.setText('? Mất/thiếu dữ liệu\n'+('Phản hồi quá hạn (>1000 ms)' if stale else 'Chưa có kết quả · '+title))
         self.logs.setPlainText('\n'.join(self.session.events[-25:]))
         if self.ai:
             from .ml.bridge import match_result
@@ -610,6 +775,7 @@ class Window(QMainWindow):
             self.last_panel=(result['session_id'],result['seq'])
             self.session.mark('panel',result)
         self.refresh_timeline()
+        self.refresh_controls()
 
     def export_log(self):
         if not self.session.log:
@@ -626,5 +792,6 @@ class Window(QMainWindow):
                 export_comparison(self.timeline_rows,Path(path+'.comparison'))
 
     def closeEvent(self,event):
+        self.timer.stop();self.panel_timer.stop()
         if self.ai:self.ai.close()
         self.session.close();event.accept()

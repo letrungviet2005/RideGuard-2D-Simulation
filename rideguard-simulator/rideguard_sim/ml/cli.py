@@ -5,7 +5,7 @@ from pathlib import Path
 
 def main(repo):
     parser=argparse.ArgumentParser()
-    parser.add_argument('command',choices=['features','train','evaluate','worker','replay','test-suite','compare-suite'])
+    parser.add_argument('command',choices=['features','train','evaluate','worker','replay','test-suite','compare-suite','select'])
     parser.add_argument('--config',default='ai/configs/sensor-lab.json')
     parser.add_argument('--session',default='RG10_03')
     parser.add_argument('--port')
@@ -13,7 +13,10 @@ def main(repo):
     parser.add_argument('--split',choices=['train','validation','test'],default='train')
     parser.add_argument('--input')
     args=parser.parse_args();config_path=(repo/args.config).resolve()
-    if args.command=='compare-suite':
+    if args.command=='select':
+        from .selection import run
+        run(repo,config_path,repo/args.output)
+    elif args.command=='compare-suite':
         if not args.input:parser.error('compare-suite needs --input raw test-suite directory')
         from .suite_report import report_suite
         result=report_suite(repo,config_path,repo/args.input,repo/args.output)

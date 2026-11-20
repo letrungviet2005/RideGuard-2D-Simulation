@@ -24,9 +24,15 @@ def create(index=0):
 
 
 def update(world, index=0):
-    if index in (0,4,5,8,9) and 2 <= world.t < 2.011 and world.ego.lane is None:
+    # Speed-only edits retain the selected scenario's compatible trajectory.
+    # A placement/heading/trajectory edit supersedes scheduled steering for EGO
+    # only; other vehicles and sensor-loss events remain part of the scenario.
+    # Live steering (control=='manual') takes EGO for good: the schedule never
+    # takes it back at the next tick or at the scheduled lane-change time.
+    manual_path=bool(world.ego.manual_fields & {'position','heading','trajectory'}) or world.ego.control=='manual'
+    if not manual_path and index in (0,4,5,8,9) and 2 <= world.t < 2.011 and world.ego.lane is None:
         world.ego.change_lane(-3.5 if index==4 else 3.5)
-    if index==7:
+    if index==7 and not manual_path and 'released' not in world.ego.manual_fields:
         # Short physical yaw excursion (not an arbitrary gyro label). The IMU
         # differentiates this heading on the next physics step, then reverses.
         u=(world.t-2)/.12

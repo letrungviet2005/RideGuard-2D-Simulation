@@ -22,7 +22,7 @@ def test_gui_import_summary_plot_offset_and_unknown_result(tmp_path):
         assert window.session.imu_offset_ms==.125
         assert 'CHƯA ĐỒNG BỘ' in window.provenance.text()
         assert window.session.result is None
-        assert 'Chưa có phản hồi' in window.reason.text()
+        assert 'Chưa có kết quả · Bộ luật · Máy tính' in window.reason.text()
         assert 'm/s²' in window.imu_values.text() and '°/s' in window.imu_values.text()
         window.show();_app.processEvents()
         assert not window.imu_plot.grab().isNull()

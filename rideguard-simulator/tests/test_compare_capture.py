@@ -7,8 +7,8 @@ log, so the tests check that it agrees with the rules in
 """
 import pytest
 
-from compare_capture import motion_states, yaw_series
-from make_synthetic_capture import SCENARIOS, generate, write_files
+from scripts.hardware.compare_capture import motion_states, yaw_series
+from scripts.data.make_synthetic_capture import SCENARIOS, generate, write_files
 from rideguard_sim import imu_import
 
 

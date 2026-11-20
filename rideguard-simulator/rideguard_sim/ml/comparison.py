@@ -60,12 +60,15 @@ def align(rules,ai,labels=None,session_id=None,end_ms=None):
     if end_ms is None:
         end_ms=max([0,*ri[0],*mi[0],*(t for t,_ in labels)])+STEP_MS
     rows=[]
+    rule_sources={r.get('rule_source','esp32') for r in rules}
+    if len(rule_sources)>1:raise ValueError('Mixed PC/hardware rule evidence must be split')
+    rule_source=next(iter(rule_sources),'unknown')
     # Last partial cell is omitted rather than inventing 50 ms of data.
     for t in range(0,int(end_ms)//STEP_MS*STEP_MS,STEP_MS):
         rule=nearest(ri,t);model=nearest(mi,t)
         for side in ('left','right'):
             r=level(rule,side);a=level(model,side);truth=labels.get((t,side))
-            rows.append(dict(timestamp_ms=t,side=side,esp32=r,ai=a,label=truth if truth in LEVELS else None,
+            rows.append(dict(timestamp_ms=t,side=side,rule_source=rule_source,esp32=r,ai=a,label=truth if truth in LEVELS else None,
                 esp32_timestamp_ms=rule['t_ms'] if rule else None,ai_timestamp_ms=model['t_ms'] if model else None,
                 comparable=r is not None and a is not None,
                 disagreement=r is not None and a is not None and r!=a,
@@ -109,6 +112,8 @@ def classification(rows,predictor):
 def summarize(rows):
     result=dict(step_ms=STEP_MS,tolerance_ms=TOLERANCE_MS,duration_policy='50 ms grid cells; gaps remain uncovered; last partial cell omitted',
         sources={},disagreement_segments=segments(rows),scoring={})
+    result['rule_source']=sorted({r.get('rule_source','esp32') for r in rows})
+    result['legacy_column_note']='esp32 is the legacy rule-column key; consult rule_source. PC is never hardware evidence.'
     for source in ('esp32','ai'):
         result['sources'][source]={}
         for side in ('left','right'):
@@ -136,8 +141,9 @@ def read_log(path):
     with Path(path).open(encoding='utf-8') as handle:
         for line in handle:
             row=json.loads(line);message=row.get('message',{})
-            if row.get('direction')=='TX' and message.get('type')=='SESSION_START':starts.add(message['session_id'])
+            if row.get('direction') in ('TX','OFFLINE') and message.get('type')=='SESSION_START':starts.add(message['session_id'])
             if row.get('direction')=='RX' and message.get('type')=='RESULT':rules.append(message)
+            elif row.get('direction')=='RULE_PC' and message.get('type')=='RULE_PC':rules.append(message)
             elif row.get('direction')=='AI' and message.get('type')=='AI':ai.append(message)
     sessions={r['session_id'] for r in rules+ai}
     if len(starts)>1:raise ValueError('Comparison log contains multiple sessions; split explicitly')

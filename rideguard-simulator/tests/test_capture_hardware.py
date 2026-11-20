@@ -7,13 +7,13 @@ that is what makes the two files replayable together.
 """
 import csv
 
-from capture_hardware import (
+from scripts.hardware.capture_hardware import (
     IMU_HEADER,
     RADAR_HEADER,
     Capture,
     write_scenario_files,
 )
-from capture_hardware import main as capture_hardware_main
+from scripts.hardware.capture_hardware import main as capture_hardware_main
 
 
 def make_stream():

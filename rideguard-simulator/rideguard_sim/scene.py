@@ -1,5 +1,5 @@
 import math
-from PySide6.QtCore import Qt, QPointF
+from PySide6.QtCore import Qt, QPointF, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF, QPainterPath
 from PySide6.QtWidgets import QWidget
 from .radar import MOUNTS, radar_to_body
@@ -9,30 +9,47 @@ COLORS = {'UNKNOWN':'#bb9af7','NONE':'#667587','MONITOR':'#ffd166','HIGH':'#ff55
 
 
 class RoadView(QWidget):
+    vehiclePicked=Signal(int)
+    vehicleMoved=Signal(int)
+    steerKey=Signal(float)  # -level (right), 0 (released), +level (left)
     def __init__(self, session):
         super().__init__()
         self.session=session
+        self.setFocusPolicy(Qt.ClickFocus)
         self.scale=13.
         self.selected=0
         self.drag=None
+        self.drag_camera=None;self.drag_offset=None;self.drag_start=None
         self.result_provider=None
         self.caption='GÓC NHÌN TỪ TRÊN • CAMERA BÁM XE'
         self.scale_peer=None
         self.setMinimumSize(420,440)
 
     def point(self,x,y):
+        cx,cy=self.camera_origin()
+        return QPointF(self.width()/2-(y-cy)*self.scale,
+                       self.height()*.38-(x-cx)*self.scale)
+
+    def camera_origin(self):
         ego=self.session.world.ego
-        return QPointF(self.width()/2-(y-ego.y)*self.scale,
-                       self.height()*.38-(x-ego.x)*self.scale)
+        return self.drag_camera if self.drag_camera is not None else (ego.x,ego.y)
 
     def world_point(self,pos):
-        ego=self.session.world.ego
-        return ego.x+(self.height()*.38-pos.y())/self.scale,ego.y+(self.width()/2-pos.x())/self.scale
+        cx,cy=self.camera_origin()
+        return cx+(self.height()*.38-pos.y())/self.scale,cy+(self.width()/2-pos.x())/self.scale
 
     def paintEvent(self,event):
         p=QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.fillRect(self.rect(),QColor('#101c2b'))
+        if getattr(self.session,'historical_no_geometry',False):
+            p.setPen(QColor('#ebf0f6'));p.drawText(14,24,self.caption)
+            p.drawText(14,48,'XEM LOG · không tái tạo quỹ đạo')
+            result=self.result_provider() if self.result_provider else None
+            for index,side in enumerate(('left','right')):
+                level=result[side]['level'] if result else 'UNKNOWN'
+                p.setBrush(QColor(COLORS[level]));p.drawEllipse(QPointF(self.width()*(index+1)/3,100),12,12)
+            p.end();return
         ego=self.session.world.ego
         for lane in (-7,-3.5,0,3.5,7):
             pen=QPen(QColor('#384b5b'),1.5,Qt.DashLine)
@@ -91,7 +108,7 @@ class RoadView(QWidget):
         p.drawText(14,25,self.caption)
         if self.session.dataset:p.drawText(14,47,'Xe: Oracle giả lập (chỉ hiển thị)')
         p.drawText(14,self.height()-38,f't = {self.session.world.t:.2f} s   |   {self.scale:.0f} px/m   |   mô hình phẳng')
-        p.drawText(14,self.height()-16,'Xám: không cảnh báo  •  Vàng: mục tiêu  •  Đỏ: cao  •  ?: mất/thiếu dữ liệu')
+        p.drawText(14,self.height()-16,'Xám NONE · Vàng MONITOR · Đỏ HIGH · ? thiếu')
         p.end()
         if result and result.get('type')=='RESULT' and getattr(self,'last_painted',None)!=(result['session_id'],result['seq']):
             self.last_painted=(result['session_id'],result['seq'])
@@ -111,20 +128,56 @@ class RoadView(QWidget):
         p.drawText(pos+QPointF(16,-6),f'{"EGO" if ego else "ID"+str(car.track_id)}  {car.speed*3.6:.1f} km/h')
 
     def wheelEvent(self,event):
+        if self.drag_camera is not None:event.ignore();return
         self.scale=max(5,min(40,self.scale+(2 if event.angleDelta().y()>0 else -2)))
         if self.scale_peer:self.scale_peer.scale=self.scale;self.scale_peer.update()
         self.update()
 
+    def keyPressEvent(self,event):
+        if event.key() in (Qt.Key_Left,Qt.Key_Right) and not event.isAutoRepeat():
+            self.steerKey.emit(1. if event.key()==Qt.Key_Left else -1.)
+            event.accept();return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self,event):
+        if event.key() in (Qt.Key_Left,Qt.Key_Right) and not event.isAutoRepeat():
+            self.steerKey.emit(0.)
+            event.accept();return
+        super().keyReleaseEvent(event)
+
     def mousePressEvent(self,event):
-        if self.session.state!='PAUSED' or self.session.pending or self.session.replay or self.session.dataset:
+        if event.button()!=Qt.LeftButton or self.session.vehicle_edit_reason():
             return
         for car in [self.session.world.ego,*self.session.world.targets]:
             if (self.point(car.x,car.y)-event.position()).manhattanLength()<35:
-                self.selected=car.track_id;self.drag=car;break
+                self.selected=car.track_id;self.drag=car
+                self.drag_camera=self.camera_origin()
+                wx,wy=self.world_point(event.position())
+                self.drag_offset=(wx-car.x,wy-car.y);self.drag_start=(car.x,car.y)
+                if self.scale_peer:self.scale_peer.drag_camera=self.drag_camera
+                self.vehiclePicked.emit(car.track_id);break
 
     def mouseMoveEvent(self,event):
         if self.drag:
-            self.drag.x,self.drag.y=self.world_point(event.position());self.drag.lane=None;self.update()
+            if self.session.vehicle_edit_reason():self.finish_drag(commit=False);return
+            wx,wy=self.world_point(event.position())
+            self.drag.x,self.drag.y=wx-self.drag_offset[0],wy-self.drag_offset[1]
+            self.update()
+            if self.scale_peer:self.scale_peer.update()
 
     def mouseReleaseEvent(self,event):
-        self.drag=None
+        if self.drag and event.button()==Qt.LeftButton:
+            self.mouseMoveEvent(event)
+            self.finish_drag(commit=not self.session.vehicle_edit_reason())
+
+    def finish_drag(self, *, commit):
+        car=self.drag
+        if car is None:return
+        x,y=car.x,car.y
+        # Restore the initial state before applying a verified manual placement.
+        car.x,car.y=self.drag_start
+        if commit:car.apply_manual(x=x,y=y)
+        self.drag=None;self.drag_camera=None;self.drag_offset=None;self.drag_start=None
+        if self.scale_peer:self.scale_peer.drag_camera=None;self.scale_peer.update()
+        self.update()
+        if commit:self.vehicleMoved.emit(car.track_id)
